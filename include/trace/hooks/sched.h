@@ -188,9 +188,15 @@ DECLARE_RESTRICTED_HOOK(android_rvh_before_pick_task_fair,
 			struct task_struct *prev, struct rq_flags *rf),
 	TP_ARGS(rq, p, se, prev, rf), 1);
 
+DECLARE_RESTRICTED_HOOK(android_rvh_before_pick_task_fair,
+	TP_PROTO(struct rq *rq, struct task_struct **p, struct sched_entity **se,
+			struct task_struct *prev, struct rq_flags *rf),
+	TP_ARGS(rq, p, se, prev, rf), 1);
+
 DECLARE_RESTRICTED_HOOK(android_rvh_balance_fair,
 	TP_PROTO(struct rq *rq, struct task_struct *prev, struct rq_flags *rf),
 	TP_ARGS(rq, prev, rf), 1);
+
 struct sched_entity;
 DECLARE_RESTRICTED_HOOK(android_rvh_place_entity,
 	TP_PROTO(struct cfs_rq *cfs_rq, struct sched_entity *se, int initial, u64 *vruntime),
