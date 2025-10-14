@@ -754,7 +754,7 @@ static bool io_is_mergeable(struct f2fs_sb_info *sbi, struct bio *bio,
 }
 
 static void add_bio_entry(struct f2fs_sb_info *sbi, struct bio *bio,
-				struct page *page, enum temp_type temp)
+				struct folio *folio, enum temp_type temp)
 {
 	struct f2fs_bio_info *io = sbi->write_io[DATA] + temp;
 	struct bio_entry *be;
@@ -763,8 +763,7 @@ static void add_bio_entry(struct f2fs_sb_info *sbi, struct bio *bio,
 	be->bio = bio;
 	bio_get(bio);
 
-	if (bio_add_page(bio, page, PAGE_SIZE, 0) != PAGE_SIZE)
-		f2fs_bug_on(sbi, 1);
+	bio_add_folio_nofail(bio, folio, folio_size(folio), 0);
 
 	f2fs_down_write(&io->bio_list_lock);
 	list_add_tail(&be->list, &io->bio_list);
@@ -904,7 +903,7 @@ alloc_new:
 		f2fs_set_bio_crypt_ctx(bio, fio->page->mapping->host,
 				page_folio(fio->page)->index, fio, GFP_NOIO);
 
-		add_bio_entry(fio->sbi, bio, page, fio->temp);
+		add_bio_entry(fio->sbi, bio, page_folio(page), fio->temp);
 	} else {
 		if (add_ipu_page(fio, &bio, page))
 			goto alloc_new;
