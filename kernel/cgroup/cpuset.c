@@ -479,7 +479,7 @@ static inline bool partition_is_populated(struct cpuset *cs,
 	if (cs->css.cgroup->nr_populated_csets)
 		return true;
 	if (!excluded_child && !cs->nr_subparts_cpus)
-		return cgroup_is_populated(cs->css.cgroup);
+		return cpuset_is_populated(cs);
 
 	rcu_read_lock();
 	cpuset_for_each_child(child, css, cs) {
