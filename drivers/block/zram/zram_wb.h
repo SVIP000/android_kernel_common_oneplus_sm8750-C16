@@ -31,11 +31,15 @@ struct zram_wb_request *alloc_wb_request(struct zram *zram,
 					 struct zram_pp_ctl *ppctl,
 					 unsigned long blk_idx);
 void free_wb_request(struct zram_wb_request *req);
+int zram_wb_dev_init(struct zram *zram);
+void zram_wb_dev_cleanup(struct zram *zram);
 #else
 inline unsigned long alloc_block_bdev(struct zram *zram) { return 0; }
 inline void free_block_bdev(struct zram *zram, unsigned long blk_idx) {};
 inline int setup_zram_writeback(void) { return 0; }
 inline void destroy_zram_writeback(void) {}
+inline int zram_wb_dev_init(struct zram *zram) { return 0; }
+inline void zram_wb_dev_cleanup(struct zram *zram) {}
 #endif
 
 #endif /* _ZRAM_WRITEBACK_H_ */

@@ -2847,6 +2847,8 @@ static int zram_add(void)
 	init_rwsem(&zram->init_lock);
 #ifdef CONFIG_ZRAM_WRITEBACK
 	spin_lock_init(&zram->wb_limit_lock);
+	/* Initialize per-device writeback structures */
+	zram_wb_dev_init(zram);
 #endif
 
 	/* gendisk structure */
@@ -3012,6 +3014,8 @@ static int zram_remove(struct zram *zram)
         shrinker_free(zram->zram_shrinker);
     }
     list_lru_destroy(&zram->zram_list_lru);
+    /* Cleanup per-device writeback structures */
+    zram_wb_dev_cleanup(zram);
 	#endif
 
 	put_disk(zram->disk);

@@ -12,9 +12,6 @@
 
 #include "zram_wb.h"
 
-static struct task_struct *wb_thread;
-static DECLARE_WAIT_QUEUE_HEAD(wb_wq);
-static struct zram_wb_request_list wb_req_list;
 static struct bio_set zram_wb_bs;
 
 /* 
@@ -149,42 +146,27 @@ static void destroy_wb_request_list(struct zram_wb_request_list *req_list)
 	}
 }
 
-static bool wb_ready_to_run(void)
+static void zram_wb_work_func(struct work_struct *work)
 {
-	int count;
+	struct zram *zram = container_of(work, struct zram, wb_work);
 
-	spin_lock_bh(&wb_req_list.lock);
-	count = wb_req_list.count;
-	spin_unlock_bh(&wb_req_list.lock);
+	while (1) {
+		struct zram_wb_request *req;
 
-	return count > 0;
-}
-
-static int wb_thread_func(void *data)
-{
-	set_freezable();
-
-	while (!kthread_should_stop()) {
-		wait_event_freezable(wb_wq, wb_ready_to_run());
-
-		while (1) {
-			struct zram_wb_request *req;
-
-			req = dequeue_wb_request(&wb_req_list);
-			if (!req)
-				break;
-			complete_wb_request(req);
-		}
+		req = dequeue_wb_request(zram->wb_req_list);
+		if (!req)
+			break;
+		complete_wb_request(req);
 	}
-	return 0;
 }
 
 static void zram_writeback_end_io(struct bio *bio)
 {
 	struct zram_wb_request *req = bio_to_zram_wb_request(bio);
+	struct zram *zram = req->zram;
 
-	enqueue_wb_request(&wb_req_list, req);
-	wake_up(&wb_wq);
+	enqueue_wb_request(zram->wb_req_list, req);
+	queue_work(system_unbound_wq, &zram->wb_work);
 }
 
 struct zram_wb_request *alloc_wb_request(struct zram *zram,
@@ -244,6 +226,39 @@ void free_wb_request(struct zram_wb_request *req)
 	bio_put(bio);
 }
 
+/* Initialize per-device writeback structures */
+int zram_wb_dev_init(struct zram *zram)
+{
+	/* Allocate writeback request list */
+	zram->wb_req_list = kzalloc(sizeof(struct zram_wb_request_list), GFP_KERNEL);
+	if (!zram->wb_req_list) {
+		return -ENOMEM;
+	}
+
+	spin_lock_init(&zram->wb_req_list->lock);
+	INIT_LIST_HEAD(&zram->wb_req_list->head);
+	zram->wb_req_list->count = 0;
+
+	/* Initialize workqueue for writeback processing */
+	INIT_WORK(&zram->wb_work, zram_wb_work_func);
+
+	/* Initialize wait queue */
+	init_waitqueue_head(&zram->wb_wq);
+
+	return 0;
+}
+
+/* Cleanup per-device writeback structures */
+void zram_wb_dev_cleanup(struct zram *zram)
+{
+	/* Destroy any pending requests */
+	if (zram->wb_req_list) {
+		destroy_wb_request_list(zram->wb_req_list);
+		kfree(zram->wb_req_list);
+		zram->wb_req_list = NULL;
+	}
+}
+
 int setup_zram_writeback(void)
 {
 	/*
@@ -261,23 +276,10 @@ int setup_zram_writeback(void)
 		pr_err("Unable to init zram_wb_bs\n");
 		return -1;
 	}
-
-	spin_lock_init(&wb_req_list.lock);
-	INIT_LIST_HEAD(&wb_req_list.head);
-	wb_req_list.count = 0;
-
-	wb_thread = kthread_run(wb_thread_func, NULL, "zram_wb_thread");
-	if (IS_ERR(wb_thread)) {
-		pr_err("Unable to create zram_wb_thread\n");
-		bioset_exit(&zram_wb_bs); 
-		return -1;
-	}
 	return 0;
 }
 
 void destroy_zram_writeback(void)
 {
-	kthread_stop(wb_thread);
-	destroy_wb_request_list(&wb_req_list);
 	bioset_exit(&zram_wb_bs);
 }
