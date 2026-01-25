@@ -1061,42 +1061,28 @@ struct zram_work {
 	int error;
 };
 
-static void zram_sync_read(struct work_struct *work)
-{
-	struct zram_work *zw = container_of(work, struct zram_work, work);
-	struct bio_vec bv;
-	struct bio bio;
-
-	bio_init(&bio, zw->zram->bdev, &bv, 1, REQ_OP_READ);
-	bio.bi_iter.bi_sector = zw->entry * (PAGE_SIZE >> 9);
-	__bio_add_page(&bio, zw->page, PAGE_SIZE, 0);
-	zw->error = submit_bio_wait(&bio);
-}
-
 /*
  * Block layer want one ->submit_bio to be active at a time, so if we use
- * chained IO with parent IO in same context, it's a deadlock. To avoid that,
- * use a worker thread context.
+ * chained IO with parent IO in same context, it's a deadlock.
+ * But for sync reads, we can safely use submit_bio_wait directly.
  */
 static int read_from_bdev_sync(struct zram *zram, struct page *page,
-				unsigned long entry)
+		unsigned long entry)
 {
-	struct zram_work work;
+	struct bio_vec bv;
+	struct bio bio;
+	int error;
 
-	work.page = page;
-	work.zram = zram;
-	work.entry = entry;
+	bio_init(&bio, zram->bdev, &bv, 1, REQ_OP_READ);
+	bio.bi_iter.bi_sector = entry * (PAGE_SIZE >> 9);
+	__bio_add_page(&bio, page, PAGE_SIZE, 0);
+	error = submit_bio_wait(&bio);
 
-	INIT_WORK_ONSTACK(&work.work, zram_sync_read);
-	queue_work(system_unbound_wq, &work.work);
-	flush_work(&work.work);
-	destroy_work_on_stack(&work.work);
-
-	return work.error;
+	return error;
 }
 
 static int read_from_bdev(struct zram *zram, struct page *page,
-			unsigned long entry, struct bio *parent)
+		unsigned long entry, struct bio *parent)
 {
 	atomic64_inc(&zram->stats.bd_reads);
 	if (!parent) {
@@ -1671,6 +1657,7 @@ static int zram_read_page(struct zram *zram, struct page *page, u32 index,
 			  struct bio *parent)
 {
 	int ret;
+	unsigned long handle = 0;
 
 	zram_slot_lock(zram, index);
 	if (!zram_test_flag(zram, index, ZRAM_WB)) {
@@ -1679,13 +1666,14 @@ static int zram_read_page(struct zram *zram, struct page *page, u32 index,
 		zram_slot_unlock(zram, index);
 	} else {
 		/*
+		 * Save handle before unlocking the slot to avoid data race
 		 * The slot should be unlocked before reading from the backing
 		 * device.
 		 */
+		handle = zram_get_handle(zram, index);
 		zram_slot_unlock(zram, index);
 
-		ret = read_from_bdev(zram, page, zram_get_handle(zram, index),
-				     parent);
+		ret = read_from_bdev(zram, page, handle, parent);
 	}
 
 	/* Should NEVER happen. Return bio error if it does. */
