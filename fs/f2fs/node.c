@@ -60,23 +60,24 @@ bool f2fs_available_free_memory(struct f2fs_sb_info *sbi, int type)
 	avail_ram = val.totalram - val.totalhigh;
 
 	/*
-	 * give 25%, 25%, 50%, 50%, 25%, 25% memory for each components respectively
+	 * give 35%, 35%, 60%, 60%, 35%, 35% memory for each components respectively
+	 * Increased thresholds for better background app survival
 	 */
 	if (type == FREE_NIDS) {
 		mem_size = (nm_i->nid_cnt[FREE_NID] *
 				sizeof(struct free_nid)) >> PAGE_SHIFT;
-		res = mem_size < ((avail_ram * nm_i->ram_thresh / 100) >> 2);
+		res = mem_size < ((avail_ram * nm_i->ram_thresh / 100) * 35 / 100);
 	} else if (type == NAT_ENTRIES) {
 		mem_size = (nm_i->nat_cnt[TOTAL_NAT] *
 				sizeof(struct nat_entry)) >> PAGE_SHIFT;
-		res = mem_size < ((avail_ram * nm_i->ram_thresh / 100) >> 2);
+		res = mem_size < ((avail_ram * nm_i->ram_thresh / 100) * 35 / 100);
 		if (excess_cached_nats(sbi))
 			res = false;
 	} else if (type == DIRTY_DENTS) {
 		if (sbi->sb->s_bdi->wb.dirty_exceeded)
 			return false;
 		mem_size = get_pages(sbi, F2FS_DIRTY_DENTS);
-		res = mem_size < ((avail_ram * nm_i->ram_thresh / 100) >> 1);
+		res = mem_size < ((avail_ram * nm_i->ram_thresh / 100) * 65 / 100);
 	} else if (type == INO_ENTRIES) {
 		int i;
 
@@ -84,17 +85,17 @@ bool f2fs_available_free_memory(struct f2fs_sb_info *sbi, int type)
 			mem_size += sbi->im[i].ino_num *
 						sizeof(struct ino_entry);
 		mem_size >>= PAGE_SHIFT;
-		res = mem_size < ((avail_ram * nm_i->ram_thresh / 100) >> 1);
+		res = mem_size < ((avail_ram * nm_i->ram_thresh / 100) * 65 / 100);
 	} else if (type == READ_EXTENT_CACHE || type == AGE_EXTENT_CACHE) {
 		enum extent_type etype = type == READ_EXTENT_CACHE ?
 						EX_READ : EX_BLOCK_AGE;
 		struct extent_tree_info *eti = &sbi->extent_tree[etype];
 
 		mem_size = (atomic_read(&eti->total_ext_tree) *
-				sizeof(struct extent_tree) +
-				atomic_read(&eti->total_ext_node) *
-				sizeof(struct extent_node)) >> PAGE_SHIFT;
-		res = mem_size < ((avail_ram * nm_i->ram_thresh / 100) >> 2);
+					sizeof(struct extent_tree) +
+					atomic_read(&eti->total_ext_node) *
+					sizeof(struct extent_node)) >> PAGE_SHIFT;
+		res = mem_size < ((avail_ram * nm_i->ram_thresh / 100) * 35 / 100);
 	} else if (type == DISCARD_CACHE) {
 		mem_size = (atomic_read(&dcc->discard_cmd_cnt) *
 				sizeof(struct discard_cmd)) >> PAGE_SHIFT;
@@ -106,10 +107,11 @@ bool f2fs_available_free_memory(struct f2fs_sb_info *sbi, int type)
 		/*
 		 * free memory is lower than watermark or cached page count
 		 * exceed threshold, deny caching compress page.
+		 * Lowered watermark for better background app survival
 		 */
-		res = (free_ram > avail_ram * sbi->compress_watermark / 100) &&
+		res = (free_ram > avail_ram * sbi->compress_watermark / 200) &&
 			(COMPRESS_MAPPING(sbi)->nrpages <
-			 free_ram * sbi->compress_percent / 100);
+			 free_ram * sbi->compress_percent / 50);
 #else
 		res = false;
 #endif
