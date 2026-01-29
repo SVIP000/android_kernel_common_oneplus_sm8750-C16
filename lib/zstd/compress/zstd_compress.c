@@ -8058,6 +8058,16 @@ static U64 ZSTD_getCParamRowSize(U64 srcSizeHint, size_t dictSize, ZSTD_CParamMo
  *  Note: srcSizeHint 0 means 0, use ZSTD_CONTENTSIZE_UNKNOWN for unknown.
  *        Use dictSize == 0 for unknown or unused.
  *  Note: `mode` controls how we treat the `dictSize`. See docs for `ZSTD_CParamMode_e`. */
+void ZSTD_optimizeCParamsForCache(ZSTD_compressionParameters* cp)
+{
+    if (cp->hashLog > DSLAB_L1DCACHE_LOG - 3){
+        cp->hashLog = DSLAB_L1DCACHE_LOG - 3;
+    }
+    if (cp->chainLog >= cp->hashLog){
+        cp->chainLog = cp->hashLog - 1;
+    }
+}
+
 static ZSTD_compressionParameters ZSTD_getCParams_internal(int compressionLevel, unsigned long long srcSizeHint, size_t dictSize, ZSTD_CParamMode_e mode)
 {
     U64 const rSize = ZSTD_getCParamRowSize(srcSizeHint, dictSize, mode);
@@ -8072,6 +8082,7 @@ static ZSTD_compressionParameters ZSTD_getCParams_internal(int compressionLevel,
     else row = compressionLevel;
 
     {   ZSTD_compressionParameters cp = ZSTD_defaultCParameters[tableID][row];
+        ZSTD_optimizeCParamsForCache(&cp);
         DEBUGLOG(5, "ZSTD_getCParams_internal selected tableID: %u row: %u strat: %u", tableID, row, (U32)cp.strategy);
         /* acceleration factor */
         if (compressionLevel < 0) {
