@@ -23,9 +23,7 @@ struct zram_wb_request_list {
 
 #if IS_ENABLED(CONFIG_ZRAM_WRITEBACK)
 unsigned long alloc_block_bdev(struct zram *zram);
-unsigned long alloc_block_bdev_batch(struct zram *zram, int count);
 void free_block_bdev(struct zram *zram, unsigned long blk_idx);
-void free_block_bdev_batch(struct zram *zram, unsigned long blk_idx, int count);
 int setup_zram_writeback(void);
 void destroy_zram_writeback(void);
 struct zram_wb_request *alloc_wb_request(struct zram *zram,

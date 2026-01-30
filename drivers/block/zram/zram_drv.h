@@ -19,16 +19,8 @@
 #include <linux/zsmalloc.h>
 #include <linux/crypto.h>
 #include <linux/list_lru.h>
-#include <linux/radix-tree.h>
 
 #include "zcomp.h"
-
-/*
- * ZRAM readahead configuration
- */
-#define ZRAM_READAHEAD_PAGES		8	/* Fixed readahead window size */
-#define ZRAM_SEQ_THRESHOLD		3	/* Sequential access threshold */
-#define ZRAM_READAHEAD_TRACK_SIZE	128	/* Size of readahead tracking buffer */
 
 /* Forward declaration to avoid circular dependency */
 struct zram_wb_request_list;
@@ -111,11 +103,9 @@ struct zram_stats {
 	atomic64_t bd_count;		/* no. of pages in backing device */
 	atomic64_t bd_reads;		/* no. of reads from backing device */
 	atomic64_t bd_writes;		/* no. of writes from backing device */
-	atomic64_t written_back_pages;
+    atomic64_t written_back_pages;
 	atomic64_t reject_reclaim_fail;
 #endif
-	atomic64_t readahead_pages;	/* no. of pages read ahead */
-	atomic64_t readahead_hits;	/* no. of readahead cache hits */
 };
 
 #ifdef CONFIG_ZRAM_MULTI_COMP
@@ -127,27 +117,6 @@ struct zram_stats {
 #define ZRAM_SECONDARY_COMP	0U
 #define ZRAM_MAX_COMPS	1U
 #endif
-
-/*
- * ZRAM readahead tracking entry
- */
-struct zram_ra_track_entry {
-	u32 index;			/* Page index that was read ahead */
-	unsigned long timestamp;	/* When it was read ahead (jiffies) */
-};
-
-/*
- * ZRAM readahead context - tracks sequential read patterns
- */
-struct zram_readahead_ctx {
-	u32 last_index;			/* Last accessed page index */
-	u32 seq_count;			/* Sequential access counter */
-	bool enabled;			/* Readahead enabled flag */
-	/* Readahead hit tracking */
-	struct zram_ra_track_entry track_buf[ZRAM_READAHEAD_TRACK_SIZE];
-	u32 track_head;			/* Head of circular buffer */
-	u32 track_count;		/* Number of valid entries */
-};
 
 struct zram {
 	struct zram_table_entry *table;
@@ -162,7 +131,6 @@ struct zram {
 	unsigned long limit_pages;
 
 	struct zram_stats stats;
-	struct zram_readahead_ctx ra_ctx;	/* Readahead context */
 	/*
 	 * This is the limit on amount of *uncompressed* worth of data
 	 * we can store in a disk.

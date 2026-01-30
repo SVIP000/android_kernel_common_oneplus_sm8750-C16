@@ -54,10 +54,10 @@
 #include "zram_drv.h"
 #include "zram_wb.h"
 
-#define CHECK_INTERVAL (60 * HZ) // 每60秒检查一次
+#define CHECK_INTERVAL (180 * HZ) // 每30秒检查一次
 #define MEM_THRESHOLD 70
 
-static u64 batch_size = 768;
+static u64 batch_size = 512;
 
 static struct task_struct *monitor_thread;
 
@@ -81,8 +81,6 @@ static const struct block_device_operations zram_devops;
 static int zram_read_page(struct zram *zram, struct page *page, u32 index,
 			  struct bio *parent);
 static void zram_writeback(struct zram *zram);
-static void zram_readahead_pages(struct zram *zram, u32 start_index,
-				 u32 nr_pages);
 
 #ifdef CONFIG_ZRAM_WRITEBACK
 static void zram_init_shrinker(struct zram *zram);
@@ -717,18 +715,6 @@ static ssize_t backing_dev_store(struct device *dev,
 		goto out;
 	}
 
-	/*
-	 * Check if backing device start sector is aligned to PAGE_SIZE.
-	 * This is important for flash storage devices where misaligned
-	 * writes can cause performance degradation and reduced lifespan.
-	 */
-	if (bdev->bd_start_sect & ((PAGE_SIZE >> SECTOR_SHIFT) - 1)) {
-		pr_err("Backing device start sector %llu is not aligned to PAGE_SIZE\n",
-			(u64)bdev->bd_start_sect);
-		err = -EINVAL;
-		goto out;
-	}
-
 	bitmap_sz = BITS_TO_LONGS(nr_pages) * sizeof(long);
 	bitmap = kvzalloc(bitmap_sz, GFP_KERNEL);
 	if (!bitmap) {
@@ -776,145 +762,74 @@ static void read_from_bdev_async(struct zram *zram, struct page *page,
 	submit_bio(bio);
 }
 
-/*
- * Spatial prefetch window for writeback
- * Scan around the given index for adjacent idle pages
- */
-#define ZRAM_WB_PREFETCH_WINDOW		8	/* Scan [index-8, index+8] */
-#define ZRAM_WB_PREFETCH_MIN_BATCH	4	/* Minimum pages for spatial batch */
-
-/* Forward declaration for spatial prefetch */
-static bool zram_add_to_pp_slot(struct zram *zram, struct zram_pp_ctl *ctl, u32 index);
-
-/*
- * Check if a page is suitable for spatial prefetch writeback
- */
-static bool zram_wb_page_suitable(struct zram *zram, u32 index)
-{
-	bool suitable;
-
-	zram_slot_lock(zram, index);
-	suitable = zram_allocated(zram, index) &&
-		   zram_test_flag(zram, index, ZRAM_IDLE) &&
-		   !zram_test_flag(zram, index, ZRAM_PP_SLOT) &&
-		   !zram_test_flag(zram, index, ZRAM_WB);
-	zram_slot_unlock(zram, index);
-
-	return suitable;
-}
-
-/*
- * Attempt to create a spatial batch by prefetching adjacent idle pages
- * Returns the number of additional pages added to the batch
- */
-static u32 zram_wb_spatial_prefetch(struct zram *zram, struct zram_pp_ctl *ctl,
-				    u32 center_index, u32 max_pages)
-{
-	u64 disksize_pages = zram->disksize >> PAGE_SHIFT;
-	u32 start = (center_index > ZRAM_WB_PREFETCH_WINDOW) ?
-		    (center_index - ZRAM_WB_PREFETCH_WINDOW) : 0;
-	u32 end = min(center_index + ZRAM_WB_PREFETCH_WINDOW + 1, (u32)disksize_pages);
-	u32 index;
-	u32 added = 0;
-
-	for (index = start; index < end && added < max_pages; index++) {
-		/* Skip the center index */
-		if (index == center_index)
-			continue;
-
-		if (!zram_wb_page_suitable(zram, index))
-			continue;
-
-		/* Try to add this page to PP slot */
-		if (!zram_add_to_pp_slot(zram, ctl, index))
-			continue;
-
-		added++;
-	}
-
-	return added;
-}
-
 static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl)
 {
-	unsigned long blk_idx = 0;
-	struct zram_pp_slot *pps;
-	int ret = 0;
-	u32 index;
-	int nr_pps = atomic_read(&ctl->num_pp_slots);
-	u32 prefetch_added;
+    unsigned long blk_idx = 0;
+    struct zram_pp_slot *pps;
+    int ret = 0;
+    u32 index;
+    int nr_pps = atomic_read(&ctl->num_pp_slots);
 
-	if (!nr_pps)
-		return 0;
+    if (!nr_pps)
+        return 0;
 
-	while ((pps = select_pp_slot(ctl))) {
-		struct zram_wb_request *req;
-		struct page *page;
+    while ((pps = select_pp_slot(ctl))) {
+        struct zram_wb_request *req;
+        struct page *page;
 
-		spin_lock(&zram->wb_limit_lock);
-		if (zram->wb_limit_enable && !zram->bd_wb_limit) {
-			spin_unlock(&zram->wb_limit_lock);
-			ret = -EIO;
-			break;
-		}
-		spin_unlock(&zram->wb_limit_lock);
+        spin_lock(&zram->wb_limit_lock);
+        if (zram->wb_limit_enable && !zram->bd_wb_limit) {
+            spin_unlock(&zram->wb_limit_lock);
+            ret = -EIO;
+            break;
+        }
+        spin_unlock(&zram->wb_limit_lock);
 
-		if (!blk_idx) {
-			blk_idx = alloc_block_bdev(zram);
-			if (!blk_idx) {
-				ret = -ENOSPC;
-				break;
-			}
-		}
+        if (!blk_idx) {
+            blk_idx = alloc_block_bdev(zram);
+            if (!blk_idx) {
+                ret = -ENOSPC;
+                break;
+            }
+        }
 
-		index = pps->index;
+        req = alloc_wb_request(zram, pps, ctl, blk_idx);
+        if (IS_ERR(req)) {
+            ret = PTR_ERR(req);
+            break;
+        }
+        page = bio_first_page_all(req->bio);
 
-		/*
-		 * Try spatial prefetch to create a larger batch.
-		 * Only prefetch if we have room for more pages in this batch.
-		 */
-		if (nr_pps < ZRAM_WB_PREFETCH_MIN_BATCH) {
-			prefetch_added = zram_wb_spatial_prefetch(zram, ctl, index,
-								  ZRAM_WB_PREFETCH_MIN_BATCH - 1);
-			nr_pps += prefetch_added;
-		}
+        index = pps->index;
+        zram_slot_lock(zram, index);
+        /*
+         * scan_slots() sets ZRAM_PP_SLOT and relases slot lock, so
+         * slots can change in the meantime. If slots are accessed or
+         * freed they lose ZRAM_PP_SLOT flag and hence we don't
+         * post-process them.
+         */
+        if (!zram_test_flag(zram, index, ZRAM_PP_SLOT))
+            goto next;
+        zram_slot_unlock(zram, index);
 
-		req = alloc_wb_request(zram, pps, ctl, blk_idx);
-		if (IS_ERR(req)) {
-			ret = PTR_ERR(req);
-			break;
-		}
-		page = bio_first_page_all(req->bio);
+        if (zram_read_page(zram, page, index, NULL)) {
+            release_pp_slot(zram, pps);
+            continue;
+        }
 
-		zram_slot_lock(zram, index);
-		/*
-		 * scan_slots() sets ZRAM_PP_SLOT and relases slot lock, so
-		 * slots can change in the meantime. If slots are accessed or
-		 * freed they lose ZRAM_PP_SLOT flag and hence we don't
-		 * post-process them.
-		 */
-		if (!zram_test_flag(zram, index, ZRAM_PP_SLOT))
-			goto next;
-		zram_slot_unlock(zram, index);
-
-		if (zram_read_page(zram, page, index, NULL)) {
-			release_pp_slot(zram, pps);
-			continue;
-		}
-
-		nr_pps--;
-		remove_pp_slot_from_ctl(pps);
-		blk_idx = 0;
-		submit_bio(req->bio);
-		continue;
+        nr_pps--;
+        remove_pp_slot_from_ctl(pps);
+        blk_idx = 0;
+        submit_bio(req->bio);
+        continue;
 
 next:
-		zram_slot_unlock(zram, index);
-		release_pp_slot(zram, pps);
-		free_wb_request(req);
+        zram_slot_unlock(zram, index);
+        release_pp_slot(zram, pps);
+        free_wb_request(req);
 
-		cond_resched();
-	}
+        cond_resched();
+    }
 
     if (blk_idx)
         free_block_bdev(zram, blk_idx);
@@ -1555,61 +1470,12 @@ static ssize_t debug_stat_show(struct device *dev,
 	return ret;
 }
 
-static ssize_t readahead_show(struct device *dev,
-		struct device_attribute *attr, char *buf)
-{
-	struct zram *zram = dev_to_zram(dev);
-	struct zram_readahead_ctx *ra = &zram->ra_ctx;
-	ssize_t ret;
-
-	down_read(&zram->init_lock);
-	ret = scnprintf(buf, PAGE_SIZE,
-			"enabled: %d\n"
-			"window_size: %u\n"
-			"seq_count: %u\n"
-			"readahead_pages: %llu\n"
-			"readahead_hits: %llu\n",
-			ra->enabled,
-			ZRAM_READAHEAD_PAGES,
-			ra->seq_count,
-			(u64)atomic64_read(&zram->stats.readahead_pages),
-			(u64)atomic64_read(&zram->stats.readahead_hits));
-	up_read(&zram->init_lock);
-
-	return ret;
-}
-
-static ssize_t readahead_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t len)
-{
-	struct zram *zram = dev_to_zram(dev);
-	struct zram_readahead_ctx *ra = &zram->ra_ctx;
-	unsigned int val;
-	int ret;
-
-	ret = kstrtouint(buf, 10, &val);
-	if (ret)
-		return ret;
-
-	down_read(&zram->init_lock);
-	ra->enabled = val ? true : false;
-	if (!ra->enabled) {
-		ra->seq_count = 0;
-		ra->track_head = 0;
-		ra->track_count = 0;
-	}
-	up_read(&zram->init_lock);
-
-	return len;
-}
-
 static DEVICE_ATTR_RO(io_stat);
 static DEVICE_ATTR_RO(mm_stat);
 #ifdef CONFIG_ZRAM_WRITEBACK
 static DEVICE_ATTR_RO(bd_stat);
 #endif
 static DEVICE_ATTR_RO(debug_stat);
-static DEVICE_ATTR_RW(readahead);
 
 static void zram_meta_free(struct zram *zram, u64 disksize)
 {
@@ -1785,148 +1651,6 @@ static int zram_read_from_zspool(struct zram *zram, struct page *page,
 		return read_compressed_page(zram, page, index);
 	else
 		return read_incompressible_page(zram, page, index);
-}
-
-/*
- * Initialize readahead context for a zram device
- */
-static void zram_readahead_init(struct zram *zram)
-{
-	struct zram_readahead_ctx *ra = &zram->ra_ctx;
-
-	ra->last_index = 0;
-	ra->seq_count = 0;
-	ra->enabled = true;
-	ra->track_head = 0;
-	ra->track_count = 0;
-}
-
-/*
- * Add a page index to readahead tracking buffer
- */
-static void zram_readahead_track(struct zram *zram, u32 index)
-{
-	struct zram_readahead_ctx *ra = &zram->ra_ctx;
-	struct zram_ra_track_entry *entry;
-
-	if (!ra->enabled)
-		return;
-
-	entry = &ra->track_buf[ra->track_head];
-	entry->index = index;
-	entry->timestamp = jiffies;
-
-	ra->track_head = (ra->track_head + 1) % ZRAM_READAHEAD_TRACK_SIZE;
-	if (ra->track_count < ZRAM_READAHEAD_TRACK_SIZE)
-		ra->track_count++;
-}
-
-/*
- * Check if a page index was read ahead (hit detection)
- * Returns true if hit, false otherwise
- */
-static bool zram_readahead_check_hit(struct zram *zram, u32 index)
-{
-	struct zram_readahead_ctx *ra = &zram->ra_ctx;
-	u32 i, pos;
-	unsigned long now = jiffies;
-	const unsigned long timeout = HZ * 5; /* 5 second timeout */
-
-	if (!ra->enabled || ra->track_count == 0)
-		return false;
-
-	/* Search through tracking buffer */
-	for (i = 0; i < ra->track_count; i++) {
-		pos = (ra->track_head + ZRAM_READAHEAD_TRACK_SIZE - 1 - i) %
-		      ZRAM_READAHEAD_TRACK_SIZE;
-
-		if (ra->track_buf[pos].index == index) {
-			/* Check if entry is still valid (not expired) */
-			if (time_after(now, ra->track_buf[pos].timestamp + timeout))
-				return false;
-
-			/* Hit found - invalidate entry to avoid double counting */
-			ra->track_buf[pos].index = U32_MAX;
-			return true;
-		}
-	}
-
-	return false;
-}
-
-/*
- * Update readahead context and detect sequential access pattern
- * Returns number of pages to readahead (0 if no readahead needed)
- */
-static u32 zram_readahead_update(struct zram *zram, u32 index)
-{
-	struct zram_readahead_ctx *ra = &zram->ra_ctx;
-	u32 readahead_nr = 0;
-
-	if (!ra->enabled)
-		return 0;
-
-	/* Check for sequential access */
-	if (index == ra->last_index + 1) {
-		/* Cap seq_count to prevent overflow */
-		if (ra->seq_count < U32_MAX)
-			ra->seq_count++;
-
-		/* Trigger readahead after threshold sequential accesses */
-		if (ra->seq_count >= ZRAM_SEQ_THRESHOLD)
-			readahead_nr = ZRAM_READAHEAD_PAGES;
-	} else {
-		/* Reset sequential counter for non-sequential access */
-		ra->seq_count = 0;
-	}
-
-	ra->last_index = index;
-	return readahead_nr;
-}
-
-/*
- * Asynchronous readahead worker function
- * Prefetches pages into page cache for faster subsequent access
- */
-static void zram_readahead_pages(struct zram *zram, u32 start_index,
-				 u32 nr_pages)
-{
-	struct page *page;
-	u32 index, end_index;
-	u64 disksize_pages;
-
-	disksize_pages = zram->disksize >> PAGE_SHIFT;
-	end_index = min(start_index + nr_pages, (u32)disksize_pages);
-
-	for (index = start_index; index < end_index; index++) {
-		/* Skip if page is not allocated in zram */
-		zram_slot_lock(zram, index);
-		if (!zram_allocated(zram, index)) {
-			zram_slot_unlock(zram, index);
-			continue;
-		}
-		zram_slot_unlock(zram, index);
-
-		/*
-		 * Allocate a page for readahead. Use GFP_NOIO to avoid
-		 * recursion into zram during memory reclaim.
-		 */
-		page = alloc_page(GFP_NOIO | __GFP_HIGHMEM);
-		if (!page)
-			break;
-
-		/* Perform the actual read - errors are ignored for readahead */
-		if (zram_read_page(zram, page, index, NULL) == 0) {
-			atomic64_inc(&zram->stats.readahead_pages);
-			/* Track this page for hit detection */
-			zram_readahead_track(zram, index);
-		}
-
-		__free_page(page);
-
-		/* Check if we should reschedule to avoid monopolizing CPU */
-		cond_resched();
-	}
 }
 
 static int zram_read_page(struct zram *zram, struct page *page, u32 index,
@@ -2556,11 +2280,9 @@ static void zram_bio_read(struct zram *zram, struct bio *bio)
 {
 	unsigned long start_time = bio_start_io_acct(bio);
 	struct bvec_iter iter = bio->bi_iter;
-	u32 readahead_nr;
-	u32 index;
 
 	do {
-		index = iter.bi_sector >> SECTORS_PER_PAGE_SHIFT;
+		u32 index = iter.bi_sector >> SECTORS_PER_PAGE_SHIFT;
 		u32 offset = (iter.bi_sector & (SECTORS_PER_PAGE - 1)) <<
 				SECTOR_SHIFT;
 		struct bio_vec bv = bio_iter_iovec(bio, iter);
@@ -2577,20 +2299,6 @@ static void zram_bio_read(struct zram *zram, struct bio *bio)
 		zram_slot_lock(zram, index);
 		zram_accessed(zram, index);
 		zram_slot_unlock(zram, index);
-
-		/* Check if this read hit a pre-fetched page */
-		if (zram_readahead_check_hit(zram, index))
-			atomic64_inc(&zram->stats.readahead_hits);
-
-		/* Update readahead context and trigger readahead if needed */
-		readahead_nr = zram_readahead_update(zram, index);
-		if (readahead_nr > 0) {
-			/*
-			 * Trigger asynchronous readahead for sequential reads.
-			 * We use index + 1 as the start since current page is already read.
-			 */
-			zram_readahead_pages(zram, index + 1, readahead_nr);
-		}
 
 		bio_advance_iter_single(bio, &iter, bv.bv_len);
 	} while (iter.bi_size);
@@ -2708,9 +2416,6 @@ static void zram_reset_device(struct zram *zram)
 	memset(&zram->stats, 0, sizeof(zram->stats));
 	atomic_set(&zram->pp_in_progress, 0);
 	reset_bdev(zram);
-
-	/* Reinitialize readahead context */
-	zram_readahead_init(zram);
 
 	comp_algorithm_set(zram, ZRAM_PRIMARY_COMP, default_compressor);
 	up_write(&zram->init_lock);
@@ -3095,7 +2800,6 @@ static struct attribute *zram_disk_attrs[] = {
 	&dev_attr_bd_stat.attr,
 #endif
 	&dev_attr_debug_stat.attr,
-	&dev_attr_readahead.attr,
 #ifdef CONFIG_ZRAM_MULTI_COMP
 	&dev_attr_recomp_algorithm.attr,
 	&dev_attr_recompress.attr,
@@ -3159,9 +2863,6 @@ static int zram_add(void)
 
 	snprintf(zram->disk->disk_name, 16, "zram%d", device_id);
 	atomic_set(&zram->pp_in_progress, 0);
-
-	/* Initialize readahead context */
-	zram_readahead_init(zram);
 
 	comp_algorithm_set(zram, ZRAM_PRIMARY_COMP, default_compressor);
 
@@ -3520,172 +3221,74 @@ static int monitor_func(void *data)
     return 0;
 }
 
-/*
- * Cluster scan window size and threshold
- */
-#define ZRAM_CLUSTER_WINDOW		8	/* Scan window: [index-4, index+4] */
-#define ZRAM_CLUSTER_MIN_PAGES		4	/* Minimum pages for batch processing */
-
-/*
- * Scan a cluster around the given index and count valid idle pages
- * Returns the number of valid idle pages found
- */
-static u32 zram_scan_cluster(struct zram *zram, u32 center_index, u32 *valid_pages)
-{
-	u64 disksize_pages = zram->disksize >> PAGE_SHIFT;
-	u32 start = (center_index > ZRAM_CLUSTER_WINDOW) ?
-		    (center_index - ZRAM_CLUSTER_WINDOW) : 0;
-	u32 end = min(center_index + ZRAM_CLUSTER_WINDOW + 1, (u32)disksize_pages);
-	u32 index, count = 0;
-	u32 i = 0;
-
-	for (index = start; index < end && i < ZRAM_CLUSTER_WINDOW * 2 + 1; index++, i++) {
-		/* Skip the center index as it's already checked */
-		if (index == center_index)
-			continue;
-
-		zram_slot_lock(zram, index);
-
-		/* Check if page is valid for writeback:
-		 * - allocated
-		 * - idle
-		 * - not already in PP_SLOT
-		 * - not already writeback
-		 */
-		if (!zram_allocated(zram, index) ||
-		    !zram_test_flag(zram, index, ZRAM_IDLE) ||
-		    zram_test_flag(zram, index, ZRAM_PP_SLOT) ||
-		    zram_test_flag(zram, index, ZRAM_WB)) {
-			zram_slot_unlock(zram, index);
-			continue;
-		}
-
-		/* Store valid page index */
-		if (count < ZRAM_CLUSTER_WINDOW * 2)
-			valid_pages[count++] = index;
-
-		zram_slot_unlock(zram, index);
-	}
-
-	return count;
-}
-
-/*
- * Add a page to PP slot for batch processing
- * Returns true on success, false on failure
- */
-static bool zram_add_to_pp_slot(struct zram *zram, struct zram_pp_ctl *ctl, u32 index)
-{
-	bool ret = true;
-
-	zram_slot_lock(zram, index);
-
-	/* Re-check conditions under lock */
-	if (!zram_allocated(zram, index) ||
-	    !zram_test_flag(zram, index, ZRAM_IDLE) ||
-	    zram_test_flag(zram, index, ZRAM_PP_SLOT) ||
-	    zram_test_flag(zram, index, ZRAM_WB)) {
-		zram_slot_unlock(zram, index);
-		return false;
-	}
-
-	/* Set PP_SLOT flag */
-	zram_set_flag(zram, index, ZRAM_PP_SLOT);
-
-	/* Add to PP slot */
-	if (!place_pp_slot(zram, ctl, index)) {
-		zram_clear_flag(zram, index, ZRAM_PP_SLOT);
-		ret = false;
-	}
-
-	zram_slot_unlock(zram, index);
-	return ret;
-}
-
 static enum lru_status zram_shrink_cb(struct list_head *item, struct list_lru_one *l,
                                       spinlock_t *lock, void *arg)
 {
-	struct zram_table_entry *entry = container_of(item, struct zram_table_entry, lru);
-	struct zram_shrink_ctx *ctx = (struct zram_shrink_ctx *)arg;
-	struct zram *zram = ctx->zram;
-	struct zram_pp_ctl *ctl = ctx->ctl;
-	enum lru_status ret = LRU_REMOVED_RETRY;
-	u32 index;
-	u32 valid_pages[ZRAM_CLUSTER_WINDOW * 2];
-	u32 cluster_count;
-	u32 i;
-	u32 pages_added = 0;
+    struct zram_table_entry *entry = container_of(item, struct zram_table_entry, lru);
+    struct zram_shrink_ctx *ctx = (struct zram_shrink_ctx *)arg;
+    struct zram *zram = ctx->zram;
+    struct zram_pp_ctl *ctl = ctx->ctl;
+    enum lru_status ret = LRU_REMOVED_RETRY;
+    u32 index;
 
-	/* Second chance algorithm: if entry was referenced, give it another chance */
-	if (entry->referenced) {
-		entry->referenced = false;
-		return LRU_ROTATE;
-	}
+    /* 第二次机会算法:如果entry被引用过,给它第二次机会 */
+    if (entry->referenced) {
+        entry->referenced = false;
+        return LRU_ROTATE;
+    }
 
-	/* Skip if entry is locked */
-	if (entry->flags & BIT(ZRAM_LOCK)) {
-		return LRU_SKIP;
-	}
+    /* 如果entry被锁定,跳过 */
+    if (entry->flags & BIT(ZRAM_LOCK)) {
+        return LRU_SKIP;
+    }
 
-	/* Move item to tail of list to prevent issues with concurrent release */
-	list_move_tail(item, &l->list);
+    /* 将item移到列表尾部,防止并发释放时出现问题 */
+    list_move_tail(item, &l->list);
 
-	/* Release LRU lock */
-	spin_unlock(lock);
+    /* 释放LRU锁 */
+    spin_unlock(lock);
 
-	/* Get entry index */
-	index = entry - zram->table;
-
-	/* Get zram slot lock for state checking and marking */
-	zram_slot_lock(zram, index);
-
-	/* Check if page is still valid */
-	if (!zram_allocated(zram, index)) {
-		zram_slot_unlock(zram, index);
-		ret = LRU_SKIP;
-		goto relock;
-	}
-
-	/* Check if page is idle and not already being processed */
-	if (!zram_test_flag(zram, index, ZRAM_IDLE) ||
-	    zram_test_flag(zram, index, ZRAM_PP_SLOT) ||
-	    zram_test_flag(zram, index, ZRAM_WB)) {
-		zram_slot_unlock(zram, index);
-		ret = LRU_SKIP;
-		goto relock;
-	}
-
-	/* Mark center page as PP_SLOT */
-	zram_set_flag(zram, index, ZRAM_PP_SLOT);
-	zram_slot_unlock(zram, index);
-
-	/* Add center page to PP slot */
-	if (!place_pp_slot(zram, ctl, index)) {
-		zram_slot_lock(zram, index);
-		zram_clear_flag(zram, index, ZRAM_PP_SLOT);
-		zram_slot_unlock(zram, index);
-		ret = LRU_RETRY;
-		goto relock;
-	}
-	pages_added++;
-
-	/* Scan cluster around this page */
-	cluster_count = zram_scan_cluster(zram, index, valid_pages);
-
-	/* Only proceed with cluster if we have enough valid pages */
-	if (cluster_count >= ZRAM_CLUSTER_MIN_PAGES - 1) {
-		for (i = 0; i < cluster_count && pages_added < ZRAM_CLUSTER_MIN_PAGES; i++) {
-			if (zram_add_to_pp_slot(zram, ctl, valid_pages[i]))
-				pages_added++;
-		}
-	}
-
-	ret = LRU_REMOVED_RETRY;
+    /* 获取entry的索引 */
+    index = entry - zram->table;
+    
+    /* 获取zram slot锁进行状态检查和标记 */
+    zram_slot_lock(zram, index);
+    
+    /* 检查页面是否仍然有效 */
+    if (!zram_allocated(zram, index)) {
+        zram_slot_unlock(zram, index);
+        ret = LRU_SKIP;
+        goto relock;
+    }
+    
+    /* 如果页面已经被标记为PP_SLOT或者已经被写回了,跳过 */
+    if (zram_test_flag(zram, index, ZRAM_PP_SLOT) ||
+        zram_test_flag(zram, index, ZRAM_WB)) {
+        zram_slot_unlock(zram, index);
+        ret = LRU_SKIP;
+        goto relock;
+    }
+    
+    /* 设置PP_SLOT标志(持锁状态下) */
+    zram_set_flag(zram, index, ZRAM_PP_SLOT);
+    
+    /* 添加到pp slot进行批量处理 */
+    if (!place_pp_slot(zram, ctl, index)) {
+        zram_clear_flag(zram, index, ZRAM_PP_SLOT);
+        zram_slot_unlock(zram, index);
+        ret = LRU_RETRY;
+        goto relock;
+    }
+    
+    /* 释放zram slot锁 */
+    zram_slot_unlock(zram, index);
+    
+    ret = LRU_REMOVED_RETRY;
 
 relock:
-	/* Re-acquire LRU lock */
-	spin_lock(lock);
-	return ret;
+    /* 重新获取LRU锁 */
+    spin_lock(lock);
+    return ret;
 }
 
 static unsigned long zram_shrinker_count(struct shrinker *shrinker, struct shrink_control *sc)

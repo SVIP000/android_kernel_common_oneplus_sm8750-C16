@@ -9,12 +9,8 @@
 #include <linux/wait.h>
 #include <linux/freezer.h>
 #include <linux/blkdev.h>
-#include <linux/bitmap.h>
-#include <linux/find.h>
 
 #include "zram_wb.h"
-
-static unsigned long __alloc_block_bdev_batch(struct zram *zram, int count);
 
 static struct bio_set zram_wb_bs;
 
@@ -48,82 +44,6 @@ retry:
 	return blk_idx;
 }
 
-unsigned long alloc_block_bdev_batch(struct zram *zram, int count)
-{
-	unsigned long blk_idx;
-	int i;
-	/* 分配降级策略: 64, 32, 16, 8, 4, 1 */
-	int fallback_sizes[] = {64, 32, 16, 8, 4, 1};
-	int num_fallbacks = ARRAY_SIZE(fallback_sizes);
-
-	/* 尝试请求的块数 */
-	if (count > 0) {
-		blk_idx = __alloc_block_bdev_batch(zram, count);
-		if (blk_idx > 0)
-			return blk_idx;
-	}
-
-	/* 尝试降级策略 */
-	for (i = 0; i < num_fallbacks; i++) {
-		int fallback_count = fallback_sizes[i];
-
-		blk_idx = __alloc_block_bdev_batch(zram, fallback_count);
-		if (blk_idx > 0)
-			return blk_idx;
-	}
-
-	return 0;
-}
-
-static unsigned long __alloc_block_bdev_batch(struct zram *zram, int count)
-{
-	unsigned long blk_idx, start_idx;
-	int i, align_mask = 0;
-
-	/* 计算对齐掩码，如果 count 是 2 的幂 */
-	if (count && !(count & (count - 1)))
-		align_mask = count - 1;
-
-retry:
-	start_idx = 1;
-	while (1) {
-		/* 寻找连续的空闲区域 */
-		blk_idx = bitmap_find_next_zero_area(zram->bitmap, zram->nr_pages, start_idx, count, 0);
-		if (blk_idx >= zram->nr_pages)
-			return 0;
-
-		/* 尝试对齐到 count 的边界 */
-		if (align_mask) {
-			unsigned long aligned_idx = (blk_idx + align_mask) & ~align_mask;
-			if (aligned_idx + count <= zram->nr_pages) {
-				blk_idx = aligned_idx;
-				/* 再次检查对齐后的区域是否空闲 */
-				if (find_next_bit(zram->bitmap, blk_idx + count, blk_idx) < blk_idx + count)
-					goto next;
-			}
-		}
-
-		/* 乐观锁策略：尝试原子地设置每一位 */
-		for (i = 0; i < count; i++) {
-			if (test_and_set_bit(blk_idx + i, zram->bitmap)) {
-				/* 冲突发生，回滚已设置的位 */
-				for (int j = 0; j < i; j++)
-					clear_bit(blk_idx + j, zram->bitmap);
-				/* 从冲突位置的下一位重新开始搜索 */
-				start_idx = blk_idx + i + 1;
-				goto retry;
-			}
-		}
-
-		atomic64_add(count, &zram->stats.bd_count);
-		return blk_idx;
-
-next:
-		/* 对齐失败，从当前区域的下一位继续搜索 */
-		start_idx = blk_idx + 1;
-	}
-}
-
 void free_block_bdev(struct zram *zram, unsigned long blk_idx)
 {
 	int was_set;
@@ -131,17 +51,6 @@ void free_block_bdev(struct zram *zram, unsigned long blk_idx)
 	was_set = test_and_clear_bit(blk_idx, zram->bitmap);
 	WARN_ON_ONCE(!was_set);
 	atomic64_dec(&zram->stats.bd_count);
-}
-
-void free_block_bdev_batch(struct zram *zram, unsigned long blk_idx, int count)
-{
-	int i;
-
-	for (i = 0; i < count; i++) {
-		int was_set = test_and_clear_bit(blk_idx + i, zram->bitmap);
-		WARN_ON_ONCE(!was_set);
-	}
-	atomic64_sub(count, &zram->stats.bd_count);
 }
 
 static void complete_wb_request(struct zram_wb_request *req)
