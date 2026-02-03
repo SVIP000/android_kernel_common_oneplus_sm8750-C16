@@ -22,9 +22,6 @@
 
 #include "zcomp.h"
 
-/* Forward declaration to avoid circular dependency */
-struct zram_wb_request_list;
-
 #define SECTORS_PER_PAGE_SHIFT	(PAGE_SHIFT - SECTOR_SHIFT)
 #define SECTORS_PER_PAGE	(1 << SECTORS_PER_PAGE_SHIFT)
 #define ZRAM_LOGICAL_BLOCK_SHIFT 12
@@ -135,7 +132,7 @@ struct zram {
 	 * This is the limit on amount of *uncompressed* worth of data
 	 * we can store in a disk.
 	 */
-	u64 disksize; /* bytes */
+	u64 disksize;	/* bytes */
 	const char *comp_algs[ZRAM_MAX_COMPS];
 	s8 num_active_comps;
 	/*
@@ -153,12 +150,6 @@ struct zram {
 	struct shrinker *zram_shrinker;
 	/* Global LRU list for zram entries. */
 	struct list_lru zram_list_lru;
-	/* Per-device writeback request list */
-	struct zram_wb_request_list *wb_req_list;
-	/* Per-device workqueue for writeback processing */
-	struct work_struct wb_work;
-	/* Wait queue for per-device writeback */
-	wait_queue_head_t wb_wq;
 #endif
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	struct dentry *debugfs_dir;
