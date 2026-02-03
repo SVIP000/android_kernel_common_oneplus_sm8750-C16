@@ -19,6 +19,7 @@
 #include <linux/zsmalloc.h>
 #include <linux/crypto.h>
 #include <linux/list_lru.h>
+#include <linux/percpu_counter.h>
 
 #include "zcomp.h"
 
@@ -65,7 +66,6 @@ enum zram_pageflags {
 
 /* Allocated for each disk page */
 struct zram_table_entry {
-
 	unsigned long handle;
 	unsigned long flags;
 #ifdef CONFIG_ZRAM_TRACK_ENTRY_ACTIME
@@ -78,29 +78,35 @@ struct zram_table_entry {
 };
 
 #ifdef CONFIG_ZRAM_WRITEBACK
-struct zram_shrink_ctx {
-	struct zram *zram;
-	struct zram_pp_ctl *ctl;
+#define BATCH_SIZE 64
+#define WINDOW_RADIUS 8
+#define MIN_AGGREGATE 4
+
+struct zram_shrink_work {
+    struct zram *zram;
+    unsigned long candidates[BATCH_SIZE]; /* 候选页面索引数组 */
+    int nr_candidates;                    /* 当前收集数量 */
+    struct zram_pp_ctl *ctl;              /* 写回控制器 */
 };
 #endif
 
 struct zram_stats {
-	atomic64_t compr_data_size;	/* compressed size of pages stored */
+	struct percpu_counter compr_data_size;	/* compressed size of pages stored */
 	atomic64_t failed_reads;	/* can happen when memory is too low */
 	atomic64_t failed_writes;	/* can happen when memory is too low */
-	atomic64_t notify_free;	/* no. of swap slot free notifications */
-	atomic64_t same_pages;		/* no. of same element filled pages */
-	atomic64_t huge_pages;		/* no. of huge pages */
-	atomic64_t huge_pages_since;	/* no. of huge pages since zram set up */
-	atomic64_t pages_stored;	/* no. of pages currently stored */
+	struct percpu_counter notify_free;	/* no. of swap slot free notifications */
+	struct percpu_counter same_pages;		/* no. of same element filled pages */
+	struct percpu_counter huge_pages;		/* no. of huge pages */
+	struct percpu_counter huge_pages_since;	/* no. of huge pages since zram set up */
+	struct percpu_counter pages_stored;	/* no. of pages currently stored */
 	atomic_long_t max_used_pages;	/* no. of maximum pages stored */
 	atomic64_t writestall;		/* no. of write slow paths */
 	atomic64_t miss_free;		/* no. of missed free */
 #ifdef	CONFIG_ZRAM_WRITEBACK
-	atomic64_t bd_count;		/* no. of pages in backing device */
-	atomic64_t bd_reads;		/* no. of reads from backing device */
-	atomic64_t bd_writes;		/* no. of writes from backing device */
-    atomic64_t written_back_pages;
+	struct percpu_counter bd_count;		/* no. of pages in backing device */
+	struct percpu_counter bd_reads;		/* no. of reads from backing device */
+	struct percpu_counter bd_writes;		/* no. of writes from backing device */
+	struct percpu_counter written_back_pages;
 	atomic64_t reject_reclaim_fail;
 #endif
 };
