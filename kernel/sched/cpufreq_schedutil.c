@@ -61,15 +61,10 @@ static DEFINE_PER_CPU(struct sugov_cpu, sugov_cpu);
 
 /************************ Governor internals ***********************/
 
-static bool sugov_should_rate_limit(struct sugov_policy *sg_policy, u64 time)
-{
-	s64 delta_ns = time - sg_policy->last_freq_update_time;
-
-	return delta_ns < sg_policy->freq_update_delay_ns;
-}
-
 static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 {
+	s64 delta_ns;
+
 	/*
 	 * Since cpufreq_update_util() is called with rq->lock held for
 	 * the @target_cpu, our per-CPU data is fully serialized.
@@ -94,16 +89,9 @@ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 		return true;
 	}
 
-	/*
-	 * When frequency-invariant utilization tracking is present, there's no
-	 * rate limit when increasing frequency. Therefore, the next frequency
-	 * must be determined before a decision can be made to rate limit the
-	 * frequency change, hence the rate limit check is bypassed here.
-	 */
-	if (arch_scale_freq_invariant())
-		return true;
+	delta_ns = time - sg_policy->last_freq_update_time;
 
-	return !sugov_should_rate_limit(sg_policy, time);
+	return delta_ns >= sg_policy->freq_update_delay_ns;
 }
 
 static bool sugov_update_next_freq(struct sugov_policy *sg_policy, u64 time,
@@ -119,27 +107,13 @@ static bool sugov_update_next_freq(struct sugov_policy *sg_policy, u64 time,
 		 * specifically wants that to happen on every update of the
 		 * policy limits.
 		 */
-		if (cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS))
-			goto must_update;
+		if (sg_policy->next_freq == next_freq &&
+		    !cpufreq_driver_test_flags(CPUFREQ_NEED_UPDATE_LIMITS))
+			return false;
+	} else if (sg_policy->next_freq == next_freq) {
+		return false;
 	}
 
-	/*
-	 * When a frequency update isn't mandatory (!need_freq_update), the rate
-	 * limit is checked again upon frequency reduction because systems with
-	 * frequency-invariant utilization bypass the rate limit check entirely
-	 * in sugov_should_update_freq(). This is done so that the rate limit
-	 * can be applied only for frequency reduction when frequency-invariant
-	 * utilization is present. Now that the next frequency is known, the
-	 * rate limit can be selectively applied to frequency reduction on such
-	 * systems. A check for arch_scale_freq_invariant() is omitted here
-	 * because unconditionally rechecking the rate limit is cheaper.
-	 */
-	if (next_freq == sg_policy->next_freq ||
-	    (next_freq < sg_policy->next_freq &&
-	     sugov_should_rate_limit(sg_policy, time)))
-		return false;
-
-must_update:
 	sg_policy->next_freq = next_freq;
 	sg_policy->last_freq_update_time = time;
 
@@ -366,6 +340,20 @@ static unsigned long sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time,
 	 */
 	return (sg_cpu->iowait_boost * max_cap) >> SCHED_CAPACITY_SHIFT;
 }
+
+#ifdef CONFIG_NO_HZ_COMMON
+static bool sugov_cpu_is_busy(struct sugov_cpu *sg_cpu)
+{
+	unsigned long idle_calls = tick_nohz_get_idle_calls_cpu(sg_cpu->cpu);
+	bool ret = idle_calls == sg_cpu->saved_idle_calls;
+
+	sg_cpu->saved_idle_calls = idle_calls;
+	return ret;
+}
+#else
+static inline bool sugov_cpu_is_busy(struct sugov_cpu *sg_cpu) { return false; }
+#endif /* CONFIG_NO_HZ_COMMON */
+
 /*
  * Make sugov_should_update_freq() ignore the rate limit when DL
  * has increased the utilization.
@@ -400,6 +388,7 @@ static void sugov_update_single_freq(struct update_util_data *hook, u64 time,
 {
 	struct sugov_cpu *sg_cpu = container_of(hook, struct sugov_cpu, update_util);
 	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
+	unsigned int cached_freq = sg_policy->cached_raw_freq;
 	unsigned long max_cap;
 	unsigned int next_f;
 
@@ -409,6 +398,20 @@ static void sugov_update_single_freq(struct update_util_data *hook, u64 time,
 		return;
 
 	next_f = get_next_freq(sg_policy, sg_cpu->util, max_cap);
+	/*
+	 * Do not reduce the frequency if the CPU has not been idle
+	 * recently, as the reduction is likely to be premature then.
+	 *
+	 * Except when the rq is capped by uclamp_max.
+	 */
+	if (!uclamp_rq_is_capped(cpu_rq(sg_cpu->cpu)) &&
+	    sugov_cpu_is_busy(sg_cpu) && next_f < sg_policy->next_freq &&
+	    !sg_policy->need_freq_update) {
+		next_f = sg_policy->next_freq;
+
+		/* Restore cached freq as next_freq has changed */
+		sg_policy->cached_raw_freq = cached_freq;
+	}
 
 	if (!sugov_update_next_freq(sg_policy, time, next_f))
 		return;
@@ -431,6 +434,7 @@ static void sugov_update_single_perf(struct update_util_data *hook, u64 time,
 				     unsigned int flags)
 {
 	struct sugov_cpu *sg_cpu = container_of(hook, struct sugov_cpu, update_util);
+	unsigned long prev_util = sg_cpu->util;
 	unsigned long max_cap;
 
 	/*
@@ -448,8 +452,18 @@ static void sugov_update_single_perf(struct update_util_data *hook, u64 time,
 	if (!sugov_update_single_common(sg_cpu, time, max_cap, flags))
 		return;
 
+	/*
+	 * Do not reduce the target performance level if the CPU has not been
+	 * idle recently, as the reduction is likely to be premature then.
+	 *
+	 * Except when the rq is capped by uclamp_max.
+	 */
+	if (!uclamp_rq_is_capped(cpu_rq(sg_cpu->cpu)) &&
+	    sugov_cpu_is_busy(sg_cpu) && sg_cpu->util < prev_util)
+		sg_cpu->util = prev_util;
+
 	cpufreq_driver_adjust_perf(sg_cpu->cpu, sg_cpu->bw_min,
-					sg_cpu->util, max_cap);
+				   sg_cpu->util, max_cap);
 
 	sg_cpu->sg_policy->last_freq_update_time = time;
 }
