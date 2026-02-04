@@ -1006,6 +1006,9 @@ void __put_task_struct(struct task_struct *tsk)
 	WARN_ON(!tsk->exit_state);
 	WARN_ON(refcount_read(&tsk->usage));
 	WARN_ON(tsk == current);
+	
+	trace_android_vh_put_task(tsk);
+	put_dmabuf_info(tsk);
 #ifdef CONFIG_HMBIRD_SCHED
 	hmbird_free(tsk);
 #endif
