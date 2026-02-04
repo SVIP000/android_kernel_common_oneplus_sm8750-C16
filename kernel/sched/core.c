@@ -7774,7 +7774,7 @@ unsigned long effective_cpu_util(int cpu, unsigned long util_cfs,
 
 	scale = arch_scale_cpu_capacity(cpu);
 
-	trace_android_rvh_effective_cpu_util(cpu, util_cfs, max, type, p, &new_util);
+	trace_android_rvh_effective_cpu_util(cpu, util_cfs, max ? *max : 0, 0, NULL, &new_util);
 	if (new_util != ULONG_MAX)
 		return new_util;
 
