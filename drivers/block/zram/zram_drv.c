@@ -2050,13 +2050,6 @@ next:
 	return 0;
 }
 
-/*
- * This function will decompress (unless it's ZRAM_HUGE) the page and then
- * attempt to compress it using provided compression algorithm priority
- * (which is potentially more effective).
- *
- * Corresponding ZRAM slot should be locked.
- */
 static int recompress_slot(struct zram *zram, u32 index, struct page *page,
 			   u64 *num_recomp_pages, u32 threshold, u32 prio,
 			   u32 prio_max)
@@ -2087,13 +2080,6 @@ static int recompress_slot(struct zram *zram, u32 index, struct page *page,
 	if (ret)
 		return ret;
 
-	/*
-	 * We touched this entry so mark it as non-IDLE. This makes sure that
-	 * we don't preserve IDLE flag and don't incorrectly pick this entry
-	 * for different post-processing type (e.g. writeback).
-	 */
-	zram_clear_flag(zram, index, ZRAM_IDLE);
-
 	class_index_old = zs_lookup_class_index(zram->mem_pool, comp_len_old);
 
 	prio = max(prio, zram_get_priority(zram, index) + 1);
@@ -2105,10 +2091,6 @@ static int recompress_slot(struct zram *zram, u32 index, struct page *page,
 	if (prio >= prio_max)
 		return 0;
 
-	/*
-	 * Iterate the secondary comp algorithms list (in order of priority)
-	 * and try to recompress the page.
-	 */
 	for (; prio < prio_max; prio++) {
 		if (!zram->comps[prio])
 			continue;
@@ -2138,36 +2120,18 @@ static int recompress_slot(struct zram *zram, u32 index, struct page *page,
 		break;
 	}
 
-	/*
-	 * We did not try to recompress, e.g. when we have only one
-	 * secondary algorithm and the page is already recompressed
-	 * using that algorithm
-	 */
 	if (!zstrm)
 		return 0;
 
-	/*
-	 * Decrement the limit (if set) on pages we can recompress, even
-	 * when current recompression was unsuccessful or did not compress
-	 * the page below the threshold, because we still spent resources
-	 * on it.
-	 */
 	if (*num_recomp_pages)
 		*num_recomp_pages -= 1;
 
 	if (class_index_new >= class_index_old) {
-		/*
-		 * Secondary algorithms failed to re-compress the page
-		 * in a way that would save memory, mark the object as
-		 * incompressible so that we will not try to compress
-		 * it again.
-		 *
-		 * We need to make sure that all secondary algorithms have
-		 * failed, so we test if the number of recompressions matches
-		 * the number of active secondary algorithms.
-		 */
-		if (num_recomps == zram->num_active_comps - 1)
+		zram_slot_lock(zram, index);
+		if (zram_test_flag(zram, index, ZRAM_PP_SLOT) &&
+		    num_recomps == zram->num_active_comps - 1)
 			zram_set_flag(zram, index, ZRAM_INCOMPRESSIBLE);
+		zram_slot_unlock(zram, index);
 		return 0;
 	}
 
@@ -2175,13 +2139,6 @@ static int recompress_slot(struct zram *zram, u32 index, struct page *page,
 	if (threshold && comp_len_new >= threshold)
 		return 0;
 
-	/*
-	 * No direct reclaim (slow path) for handle allocation and no
-	 * re-compression attempt (unlike in zram_write_bvec()) since
-	 * we already have stored that object in zsmalloc. If we cannot
-	 * alloc memory for recompressed object then we bail out and
-	 * simply keep the old (existing) object in zsmalloc.
-	 */
 	handle_new = zs_malloc(zram->mem_pool, comp_len_new,
 			       __GFP_KSWAPD_RECLAIM |
 			       __GFP_NOWARN |
@@ -2195,8 +2152,14 @@ static int recompress_slot(struct zram *zram, u32 index, struct page *page,
 	dst = zs_map_object(zram->mem_pool, handle_new, ZS_MM_WO);
 	memcpy(dst, zstrm->buffer, comp_len_new);
 	zcomp_stream_put(zram->comps[prio]);
-
 	zs_unmap_object(zram->mem_pool, handle_new);
+	zram_slot_lock(zram, index);
+	if (!zram_test_flag(zram, index, ZRAM_PP_SLOT)) {
+		zram_slot_unlock(zram, index);
+		zs_free(zram->mem_pool, handle_new);
+		return -EAGAIN;
+	}
+	zram_clear_flag(zram, index, ZRAM_IDLE);
 
 	zram_free_page(zram, index);
 	zram_set_handle(zram, index, handle_new);
@@ -2206,6 +2169,7 @@ static int recompress_slot(struct zram *zram, u32 index, struct page *page,
 	percpu_counter_add(&zram->stats.compr_data_size, comp_len_new);
 	percpu_counter_inc(&zram->stats.pages_stored);
 
+	zram_slot_unlock(zram, index);
 	return 0;
 }
 
@@ -2324,15 +2288,10 @@ static ssize_t recompress_store(struct device *dev,
 		if (!num_recomp_pages)
 			break;
 
-		zram_slot_lock(zram, pps->index);
-		if (!zram_test_flag(zram, pps->index, ZRAM_PP_SLOT))
-			goto next;
 
 		err = recompress_slot(zram, pps->index, page,
 				      &num_recomp_pages, threshold,
 				      prio, prio_max);
-next:
-		zram_slot_unlock(zram, pps->index);
 		release_pp_slot(zram, pps);
 
 		if (err) {
@@ -2777,11 +2736,18 @@ static int zram_open(struct gendisk *disk, blk_mode_t mode)
 		return -EBUSY;
 	return 0;
 }
+static void zram_free_disk(struct gendisk *disk)
+{
+	struct zram *zram = disk->private_data;
+	zram_stats_destroy(zram);
+	kfree(zram);
+}
 
 static const struct block_device_operations zram_devops = {
 	.open = zram_open,
 	.submit_bio = zram_submit_bio,
 	.swap_slot_free_notify = zram_slot_free_notify,
+	.free_disk = zram_free_disk,
 	.owner = THIS_MODULE
 };
 
@@ -3160,11 +3126,22 @@ static int zram_add(void)
 	zram_debugfs_register(zram);
 	pr_info("Added device: %s with default size %llu bytes\n", zram->disk->disk_name, default_disksize);
 	return device_id;
+
+#ifdef CONFIG_ZRAM_WRITEBACK
+
 lru_fail:
 	unregister_shrinker(zram->zram_shrinker);
 	shrinker_free(zram->zram_shrinker);
+#endif
+
 out_cleanup_disk:
-	put_disk(zram->disk);
+	if (zram->disk) {
+		put_disk(zram->disk);
+
+	}
+	idr_remove(&zram_index_idr, device_id);
+	return ret;
+
 out_free_idr:
 	idr_remove(&zram_index_idr, device_id);
 out_free_stats:
@@ -3227,8 +3204,6 @@ static int zram_remove(struct zram *zram)
 	#endif
 
 	put_disk(zram->disk);
-	zram_stats_destroy(zram);
-	kfree(zram);
 	return 0;
 }
 
@@ -3418,7 +3393,6 @@ static int monitor_func(void *data)
 		 * 每个设备单独获取引用、加读锁处理，确保并发安全。
 		 */
 		for (i = 0; i < num_devs; i++) {
-			/* 重新查找设备并获取引用，防止处理过程中被 remove */
 			rcu_read_lock();
 			zram = idr_find(&zram_index_idr, zram_ids[i]);
 			if (!zram || !zram->disk || !get_device(disk_to_dev(zram->disk))) {
@@ -3432,11 +3406,6 @@ static int monitor_func(void *data)
 			total_zram_usage += zram_usage;
 			zram_count++;
 
-			/*
-			 * 关键：必须加读锁！
-			 * mark_idle 内部虽然保护了单个 slot，但没有保护 zram->table
-			 * 指针本身。如果此时设备被 reset，table 会被释放，导致 UAF。
-			 */
 			down_read(&zram->init_lock);
 			if (init_done(zram) && cutoff_time != 0)
 				mark_idle(zram, cutoff_time);

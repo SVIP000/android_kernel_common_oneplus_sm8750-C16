@@ -158,16 +158,13 @@ static void complete_wb_batch(struct zram_wb_batch_request *req)
 
 		/* 更新统计 */
 		percpu_counter_inc(&zram->stats.bd_writes);
+		spin_lock(&zram->wb_limit_lock);
 
 		/* 锁定槽位进行状态变更 */
 		zram_slot_lock(zram, index);
-
-		/*
-		 * 极少数情况：在写回期间槽位被重新分配或释放了
-		 * 我们必须检查 ZRAM_PP_SLOT 标志
-		 */
 		if (!zram_test_flag(zram, index, ZRAM_PP_SLOT)) {
 			zram_slot_unlock(zram, index);
+			spin_unlock(&zram->wb_limit_lock);
 			goto handle_err;
 		}
 
@@ -178,12 +175,11 @@ static void complete_wb_batch(struct zram_wb_batch_request *req)
 		percpu_counter_inc(&zram->stats.pages_stored);
 
 		/* 更新写回限制配额 */
-		spin_lock(&zram->wb_limit_lock);
 		if (zram->wb_limit_enable && zram->bd_wb_limit > 0)
 			zram->bd_wb_limit -=  1UL << (PAGE_SHIFT - 12);
-		spin_unlock(&zram->wb_limit_lock);
 
 		zram_slot_unlock(zram, index);
+		spin_unlock(&zram->wb_limit_lock);
 		
 		/* 释放后处理槽位包装器 */
 		free_pp_slot(zram, pps);
@@ -275,7 +271,10 @@ static bool wb_ready_to_run(void)
 
 static int wb_thread_func(void *data)
 {
+	unsigned int nofs_flags;
+
 	set_freezable();
+	nofs_flags = memalloc_noreclaim_save();
 
 	while (!kthread_should_stop()) {
 		wait_event_freezable(wb_wq, wb_ready_to_run());
@@ -288,6 +287,8 @@ static int wb_thread_func(void *data)
 			complete_wb_batch(req);
 		}
 	}
+
+	memalloc_noreclaim_restore(nofs_flags);
 	return 0;
 }
 
