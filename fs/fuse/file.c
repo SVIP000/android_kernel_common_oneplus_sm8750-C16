@@ -22,6 +22,13 @@
 #include <linux/fs.h>
 #include <linux/filelock.h>
 
+static inline struct page *grab_cache_page_write_begin(struct address_space *mapping,
+							pgoff_t index)
+{
+	return pagecache_get_page(mapping, index, FGP_WRITEBEGIN,
+				  mapping_gfp_mask(mapping));
+}
+
 static int fuse_send_open(struct fuse_mount *fm, u64 nodeid,
 			  unsigned int open_flags, int opcode,
 			  struct fuse_open_out *outargp)

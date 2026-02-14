@@ -1808,7 +1808,7 @@ static void lock_zspage(struct zspage *zspage)
 			break;
 		get_page(page);
 		migrate_read_unlock(zspage);
-		wait_on_page_locked(page);
+		folio_wait_locked(page_folio(page));
 		put_page(page);
 	}
 
@@ -1819,7 +1819,7 @@ static void lock_zspage(struct zspage *zspage)
 		} else {
 			get_page(page);
 			migrate_read_unlock(zspage);
-			wait_on_page_locked(page);
+			folio_wait_locked(page_folio(page));
 			put_page(page);
 			migrate_read_lock(zspage);
 		}

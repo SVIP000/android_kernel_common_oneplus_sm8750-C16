@@ -53,6 +53,13 @@
 
 #include "internal.h"
 
+static inline struct page *grab_cache_page_write_begin(struct address_space *mapping,
+							pgoff_t index)
+{
+	return pagecache_get_page(mapping, index, FGP_WRITEBEGIN,
+				  mapping_gfp_mask(mapping));
+}
+
 static int fsync_buffers_list(spinlock_t *lock, struct list_head *list);
 static void submit_bh_wbc(blk_opf_t opf, struct buffer_head *bh,
 			  enum rw_hint hint, struct writeback_control *wbc);
@@ -2828,7 +2835,7 @@ static void submit_bh_wbc(blk_opf_t opf, struct buffer_head *bh,
 
 	if (wbc) {
 		wbc_init_bio(wbc, bio);
-		wbc_account_cgroup_owner(wbc, bh->b_page, bh->b_size);
+		wbc_account_cgroup_owner(wbc, page_folio(bh->b_page), bh->b_size);
 	}
 
 	submit_bio(bio);

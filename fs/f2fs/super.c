@@ -2994,6 +2994,11 @@ int f2fs_quota_sync(struct super_block *sb, int type)
 	return ret;
 }
 
+int f2fs_do_quota_sync(struct super_block *sb, int type)
+{
+	return f2fs_quota_sync(sb, type);
+}
+
 static int f2fs_quota_on(struct super_block *sb, int type, int format_id,
 							const struct path *path)
 {
