@@ -40,27 +40,27 @@ static unsigned long alloc_block_bdev_range(struct zram *zram, int count)
 	unsigned long i;
 	/*
 	 * 自动对齐：尝试让起始索引按 count 对齐 (前提 count 是 2 的幂)
-     * 这样可以显著提高底层块设备的合并效率
-     */
-    unsigned long align_mask = (unsigned long)count - 1;
+	 * 这样可以显著提高底层块设备的合并效率
+	 */
+	unsigned long align_mask = (unsigned long)count - 1;
 
 retry:
-	/* 
-	 * 1. 查找：寻找连续 count 个 0 位 
+	/*
+	 * 1. 查找：寻找连续 count 个 0 位
 	 */
-	blk_idx = bitmap_find_next_zero_area(zram->bitmap, zram->nr_pages, 
+	blk_idx = bitmap_find_next_zero_area(zram->bitmap, zram->nr_pages,
 					     blk_idx, count, align_mask);
-	
+
 	if (blk_idx >= zram->nr_pages)
 		return 0;
 
-	/* 
+	/*
 	 * 2. 尝试锁定：原子地设置每一位
 	 * 这是一个乐观锁策略。如果中途失败，必须回滚。
 	 */
 	for (i = 0; i < count; i++) {
 		if (test_and_set_bit(blk_idx + i, zram->bitmap)) {
-			/* 
+			/*
 			 * 发生竞争：有人在我们之前抢占了 blk_idx + i。
 			 * 回滚：清除之前已经由本线程设置的位 [0 ... i-1]
 			 */
@@ -68,9 +68,13 @@ retry:
 				i--;
 				clear_bit(blk_idx + i, zram->bitmap);
 			}
-			
-			/* 从冲突位置的下一位重新开始搜索 */
-			blk_idx++; 
+
+			blk_idx = blk_idx + i + 1;
+
+			if (align_mask) {
+				blk_idx = (blk_idx + align_mask) & ~align_mask;
+			}
+
 			goto retry;
 		}
 	}
@@ -167,6 +171,7 @@ static void complete_wb_batch(struct zram_wb_batch_request *req)
 			spin_unlock(&zram->wb_limit_lock);
 			goto handle_err;
 		}
+		zram_clear_flag(zram, index, ZRAM_PP_SLOT);
 
 		/* 成功路径：释放内存页，设置写回标志 */
 		zram_free_page(zram, index);
@@ -191,20 +196,23 @@ handle_err:
 		free_pp_slot(zram, pps);
 	}
 
-	/* 
+	/*
 	 * 重要：ctl->num_pp_slots 记录了待处理的总数
 	 * 此时减少当前批次处理的数量 (req->count)
+	 * 异步 Shrinker 模式下 ctl 为 NULL。
 	 */
-	if (atomic_sub_and_test(req->count, &ctl->num_pp_slots))
-		complete(&ctl->all_done);
+	if (ctl) {
+		if (atomic_sub_and_test(req->count, &ctl->num_pp_slots))
+			complete(&ctl->all_done);
+	}
 
 	/* 释放 BIO 及其挂载的所有 pages */
 	{
 		struct bio_vec *bv;
 		struct bvec_iter_all iter;
-		
+
 		bio_for_each_segment_all(bv, bio, iter) {
-			__free_page(bv->bv_page);
+			mempool_free(bv->bv_page, zram->wb_page_pool);
 		}
 		/* bio_put 会释放 bio 内存以及 front_pad */
 		bio_put(bio);
@@ -254,7 +262,7 @@ static void destroy_wb_request_list(struct zram_wb_request_list *req_list)
 		struct bio_vec *bv;
 		struct bvec_iter_all iter;
 		bio_for_each_segment_all(bv, req->bio, iter) {
-			__free_page(bv->bv_page);
+			mempool_free(bv->bv_page, req->zram->wb_page_pool);
 		}
 		bio_put(req->bio);
 	}
@@ -299,12 +307,13 @@ static void zram_writeback_end_io(struct bio *bio)
 	wake_up(&wb_wq);
 }
 
-/* 
- * 外部接口：分配一个新的批次请求 
+/*
+ * 外部接口：分配一个新的批次请求
  */
 struct zram_wb_batch_request *alloc_wb_batch_request(struct zram *zram,
 						     struct zram_pp_ctl *ctl,
-						     unsigned long start_blk_idx)
+						     unsigned long start_blk_idx,
+						     gfp_t gfp_mask)
 {
 	struct bio *bio;
 	struct zram_wb_batch_request *req;
@@ -314,8 +323,8 @@ struct zram_wb_batch_request *alloc_wb_batch_request(struct zram *zram,
 	 * ZRAM_WB_MAX_BATCH_SIZE 定义了 bio_vec 的最大数量。
 	 * front_pad 会自动被 bio_alloc 分配在 bio 之前。
 	 */
-	bio = bio_alloc_bioset(zram->bdev, ZRAM_WB_MAX_BATCH_SIZE, 
-			       REQ_OP_WRITE, GFP_NOIO,
+	bio = bio_alloc_bioset(zram->bdev, ZRAM_WB_MAX_BATCH_SIZE,
+			       REQ_OP_WRITE, gfp_mask,
 			       &zram_wb_bs);
 	if (!bio)
 		return NULL;

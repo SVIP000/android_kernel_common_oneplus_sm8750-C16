@@ -59,6 +59,9 @@ enum zram_pageflags {
 	ZRAM_COMP_PRIORITY_BIT1, /* First bit of comp priority index */
 	ZRAM_COMP_PRIORITY_BIT2, /* Second bit of comp priority index */
 
+	ZRAM_REFERENCED, /* Page was referenced since last shrinker scan */
+	ZRAM_ACTIVE, /* Page is in active list (percpu_pagevec or active_list) */
+
 	__NR_ZRAM_PAGEFLAGS,
 };
 
@@ -73,14 +76,19 @@ struct zram_table_entry {
 #endif
 #ifdef	CONFIG_ZRAM_WRITEBACK
 	struct list_head lru;
-	bool referenced;
 #endif
 };
 
 #ifdef CONFIG_ZRAM_WRITEBACK
-#define BATCH_SIZE 64
+#define BATCH_SIZE 32
 #define WINDOW_RADIUS 8
 #define MIN_AGGREGATE 4
+#define ZRAM_PAGEVEC_SIZE 128
+struct zram_pagevec {
+	local_lock_t lock;
+	unsigned long indices[ZRAM_PAGEVEC_SIZE];
+	int nr;
+};
 
 struct zram_shrink_work {
     struct zram *zram;
@@ -156,6 +164,12 @@ struct zram {
 	struct shrinker *zram_shrinker;
 	/* Global LRU list for zram entries. */
 	struct list_lru zram_list_lru;
+	mempool_t *wb_page_pool;
+	unsigned long shrinker_active_start;
+	atomic_t shrinker_in_active_period;
+	struct zram_pagevec __percpu *active_pagevecs;
+	struct list_head active_list;
+	spinlock_t active_list_lock;
 #endif
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	struct dentry *debugfs_dir;
@@ -173,6 +187,7 @@ void zram_slot_unlock(struct zram *zram, u32 index);
 void zram_set_handle(struct zram *zram, u32 index, unsigned long handle);
 bool zram_test_flag(struct zram *zram, u32 index, enum zram_pageflags flag);
 void zram_set_flag(struct zram *zram, u32 index, enum zram_pageflags flag);
+void zram_clear_flag(struct zram *zram, u32 index, enum zram_pageflags flag);
 void zram_free_page(struct zram *zram, size_t index);
 
 #if defined CONFIG_ZRAM_WRITEBACK || defined CONFIG_ZRAM_MULTI_COMP

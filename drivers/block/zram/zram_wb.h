@@ -47,7 +47,8 @@ void free_block_bdev_range(struct zram *zram, unsigned long blk_idx, int count);
 
 struct zram_wb_batch_request *alloc_wb_batch_request(struct zram *zram,
 						     struct zram_pp_ctl *ctl,
-						     unsigned long start_blk_idx);
+						     unsigned long start_blk_idx,
+						     gfp_t gfp_mask);
 
 int setup_zram_writeback(void);
 void destroy_zram_writeback(void);
