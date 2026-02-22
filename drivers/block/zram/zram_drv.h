@@ -85,7 +85,7 @@ struct zram_table_entry {
 #define MIN_AGGREGATE 4
 #define ZRAM_PAGEVEC_SIZE 128
 struct zram_pagevec {
-	local_lock_t lock;
+	spinlock_t lock;  /* 使用标准自旋锁以支持跨 CPU drain */
 	unsigned long indices[ZRAM_PAGEVEC_SIZE];
 	int nr;
 };
@@ -161,6 +161,7 @@ struct zram {
 	struct block_device *bdev;
 	unsigned long *bitmap;
 	unsigned long nr_pages;
+	spinlock_t bitmap_lock;  /* 保护 bitmap 的分配与释放 */
 	struct shrinker *zram_shrinker;
 	/* Global LRU list for zram entries. */
 	struct list_lru zram_list_lru;
@@ -170,6 +171,7 @@ struct zram {
 	struct zram_pagevec __percpu *active_pagevecs;
 	struct list_head active_list;
 	spinlock_t active_list_lock;
+	atomic_long_t active_pages;  /* 实时追踪活跃链表长度 */
 #endif
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	struct dentry *debugfs_dir;
@@ -207,6 +209,7 @@ struct zram_pp_ctl {
 	struct list_head	pp_buckets[NUM_PP_BUCKETS];
 	struct completion	all_done;
 	atomic_t		num_pp_slots;
+	unsigned long		deadline_jiffies;  /* 时间限制截止时间 */
 };
 
 void free_pp_slot(struct zram *zram, struct zram_pp_slot *pps);

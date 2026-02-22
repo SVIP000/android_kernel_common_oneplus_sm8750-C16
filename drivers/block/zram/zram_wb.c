@@ -31,56 +31,31 @@ static struct bio_set zram_wb_bs;
 	((struct zram_wb_batch_request *)((char *)(bio) - ZRAM_WB_FRONT_PAD))
 
 /* 
- * 内部辅助函数：尝试分配指定长度的连续区间
+ * 内部辅助函数：分配指定长度的连续区间
+ * 使用 spinlock 保护，避免批量分配时的 retry 风暴
  * 返回值：成功返回起始索引，失败返回 0
  */
 static unsigned long alloc_block_bdev_range(struct zram *zram, int count)
 {
-	unsigned long blk_idx = 1; /* skip 0 bit */
-	unsigned long i;
-	/*
-	 * 自动对齐：尝试让起始索引按 count 对齐 (前提 count 是 2 的幂)
-	 * 这样可以显著提高底层块设备的合并效率
-	 */
+	unsigned long blk_idx;
 	unsigned long align_mask = (unsigned long)count - 1;
 
-retry:
-	/*
-	 * 1. 查找：寻找连续 count 个 0 位
-	 */
+	spin_lock(&zram->bitmap_lock);
+
 	blk_idx = bitmap_find_next_zero_area(zram->bitmap, zram->nr_pages,
-					     blk_idx, count, align_mask);
+					     1, count, align_mask);
 
-	if (blk_idx >= zram->nr_pages)
-		return 0;
-
-	/*
-	 * 2. 尝试锁定：原子地设置每一位
-	 * 这是一个乐观锁策略。如果中途失败，必须回滚。
-	 */
-	for (i = 0; i < count; i++) {
-		if (test_and_set_bit(blk_idx + i, zram->bitmap)) {
-			/*
-			 * 发生竞争：有人在我们之前抢占了 blk_idx + i。
-			 * 回滚：清除之前已经由本线程设置的位 [0 ... i-1]
-			 */
-			while (i > 0) {
-				i--;
-				clear_bit(blk_idx + i, zram->bitmap);
-			}
-
-			blk_idx = blk_idx + i + 1;
-
-			if (align_mask) {
-				blk_idx = (blk_idx + align_mask) & ~align_mask;
-			}
-
-			goto retry;
-		}
+	if (blk_idx < zram->nr_pages) {
+		bitmap_set(zram->bitmap, blk_idx, count);
+	} else {
+		blk_idx = 0;
 	}
 
-	/* 成功分配 */
-	percpu_counter_add(&zram->stats.bd_count, count);
+	spin_unlock(&zram->bitmap_lock);
+
+	if (blk_idx)
+		percpu_counter_add(&zram->stats.bd_count, count);
+
 	return blk_idx;
 }
 
@@ -116,18 +91,13 @@ unsigned long alloc_block_bdev(struct zram *zram)
 	return alloc_block_bdev_batch(zram, 1, &count);
 }
 
-/* 新增：批量释放辅助函数 */
+/* 批量释放辅助函数，使用 spinlock 保护 */
 void free_block_bdev_range(struct zram *zram, unsigned long blk_idx, int count)
 {
-	int i;
-	/* 
-	 * 注意：这里假设调用者保证了范围的合法性
-	 * 逐个清除位
-	 */
-	for (i = 0; i < count; i++) {
-		if (!test_and_clear_bit(blk_idx + i, zram->bitmap))
-			WARN_ON_ONCE(1); /* 释放了未分配的块 */
-	}
+	spin_lock(&zram->bitmap_lock);
+	bitmap_clear(zram->bitmap, blk_idx, count);
+	spin_unlock(&zram->bitmap_lock);
+
 	percpu_counter_sub(&zram->stats.bd_count, count);
 }
 
