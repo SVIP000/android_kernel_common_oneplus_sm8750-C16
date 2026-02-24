@@ -141,7 +141,6 @@ static void complete_wb_batch(struct zram_wb_batch_request *req)
 			spin_unlock(&zram->wb_limit_lock);
 			goto handle_err;
 		}
-		zram_clear_flag(zram, index, ZRAM_PP_SLOT);
 
 		/* 成功路径：释放内存页，设置写回标志 */
 		zram_free_page(zram, index);
@@ -153,11 +152,11 @@ static void complete_wb_batch(struct zram_wb_batch_request *req)
 		if (zram->wb_limit_enable && zram->bd_wb_limit > 0)
 			zram->bd_wb_limit -=  1UL << (PAGE_SHIFT - 12);
 
+		zram_clear_flag(zram, index, ZRAM_PP_SLOT);
 		zram_slot_unlock(zram, index);
 		spin_unlock(&zram->wb_limit_lock);
 		
-		/* 释放后处理槽位包装器 */
-		free_pp_slot(zram, pps);
+		kfree(pps);
 		continue;
 
 handle_err:
@@ -255,7 +254,7 @@ static int wb_thread_func(void *data)
 	nofs_flags = memalloc_noreclaim_save();
 
 	while (!kthread_should_stop()) {
-		wait_event_freezable(wb_wq, wb_ready_to_run());
+		wait_event_freezable(wb_wq, wb_ready_to_run() || kthread_should_stop());
 
 		while (1) {
 			struct zram_wb_batch_request *req;
