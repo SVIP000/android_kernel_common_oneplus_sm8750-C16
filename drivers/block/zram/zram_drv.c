@@ -94,7 +94,7 @@ u8 __read_mostly sysctl_zram_recomp_immediate = 1;
 #endif
 
 #ifdef CONFIG_ZRAM_WRITEBACK
-unsigned int __read_mostly sysctl_zram_shrinker_active_window_ms = 10000;
+unsigned int __read_mostly sysctl_zram_shrinker_active_window_ms = 5000;  /* 默认 5 秒 */
 #endif
 
 static struct ctl_table zram_sysctl_table[] = {
@@ -3725,7 +3725,7 @@ static int monitor_func(void *data)
 		if (mem_usage > 80) {
 			current_check_interval = 60 * HZ;
 			current_idle_threshold_sec = 30;
-			current_max_scan = 2000000;  /* 高压力时扫描更多页面 */
+			current_max_scan = 1750000;  /* 高压力时扫描更多页面 */
 			dynamic_adjustment_active = true;
 
 			if (!in_writeback_cooldown) {
@@ -3742,12 +3742,12 @@ static int monitor_func(void *data)
 				saved_shrinker_window = sysctl_zram_shrinker_active_window_ms;
 				shrinker_window_overridden = true;
 			}
-			sysctl_zram_shrinker_active_window_ms = 15000;
+			sysctl_zram_shrinker_active_window_ms = 10000;
 
 		} else if (mem_usage > 74) {
 			current_check_interval = 60 * HZ;
 			current_idle_threshold_sec = 45;
-			current_max_scan = 1500000;  /* 中等压力时适度增加扫描 */
+			current_max_scan = 1250000;  /* 中等压力时适度增加扫描 */
 			dynamic_adjustment_active = true;
 
 			if (high_pressure_count > 0 || in_writeback_cooldown) {
@@ -3755,6 +3755,10 @@ static int monitor_func(void *data)
 				in_writeback_cooldown = false;
 			}
 
+			if (shrinker_window_overridden) {
+				sysctl_zram_shrinker_active_window_ms = saved_shrinker_window;
+				shrinker_window_overridden = false;
+			}
 		} else {
 			if (high_pressure_count > 0 || in_writeback_cooldown) {
 				high_pressure_count = 0;
