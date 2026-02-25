@@ -1849,6 +1849,11 @@ static void zram_meta_free(struct zram *zram, u64 disksize)
 		zram_free_page(zram, index);
 
 	zs_destroy_pool(zram->mem_pool);
+
+	if (zram->io_page_pool) {
+		mempool_destroy(zram->io_page_pool);
+		zram->io_page_pool = NULL;
+	}
 	
 	/* Destroy the per-device idle LRU */
 	list_lru_destroy(&zram->zram_list_lru);
@@ -1885,10 +1890,14 @@ static bool zram_meta_alloc(struct zram *zram, u64 disksize)
 
 	if (!huge_class_size)
 		huge_class_size = zs_huge_class_size(zram->mem_pool);
+
+	zram->io_page_pool = mempool_create_page_pool(32, 0);
+	if (!zram->io_page_pool)
+		goto err_pool;
 	
 	/* Initialize the per-device idle LRU */
 	if (list_lru_init(&zram->zram_list_lru))
-		goto err_pool;
+		goto err_io_pool;
 	
 #ifdef CONFIG_ZRAM_WRITEBACK
 	zram->active_pagevecs = alloc_percpu(struct zram_pagevec);
@@ -1915,6 +1924,8 @@ static bool zram_meta_alloc(struct zram *zram, u64 disksize)
 err_lru:
 	list_lru_destroy(&zram->zram_list_lru);
 #endif
+err_io_pool:
+	mempool_destroy(zram->io_page_pool);
 err_pool:
 	zs_destroy_pool(zram->mem_pool);
 err_table:
@@ -2111,13 +2122,13 @@ static int zram_bvec_read_partial(struct zram *zram, struct bio_vec *bvec,
 	struct page *page;
 	int ret;
 
-	page = alloc_page(GFP_NOWAIT);
+	page = mempool_alloc(zram->io_page_pool, GFP_NOIO | __GFP_NOWARN);
 	if (!page)
 		return -ENOMEM;
 	ret = zram_read_page(zram, page, index, NULL);
 	if (likely(!ret))
 		memcpy_to_bvec(bvec, page_address(page) + offset);
-	__free_page(page);
+	mempool_free(page, zram->io_page_pool);
 	return ret;
 }
 
@@ -2255,7 +2266,7 @@ static int zram_bvec_write_partial(struct zram *zram, struct bio_vec *bvec,
 	struct page *page;
 	int ret;
 
-	page = alloc_page(GFP_NOWAIT);
+	page = mempool_alloc(zram->io_page_pool, GFP_NOIO | __GFP_NOWARN);
 	if (!page)
 		return -ENOMEM;
 
@@ -2264,7 +2275,7 @@ static int zram_bvec_write_partial(struct zram *zram, struct bio_vec *bvec,
 		memcpy_from_bvec(page_address(page) + offset, bvec);
 		ret = zram_write_page(zram, page, index);
 	}
-	__free_page(page);
+	mempool_free(page, zram->io_page_pool);
 	return ret;
 }
 
