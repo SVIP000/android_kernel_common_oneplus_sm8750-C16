@@ -3609,7 +3609,7 @@ static int zram_proactive_writeback(struct zram *zram, unsigned long timeout_ms)
 	int pages_to_write = 0;
 	int pages_written = 0;
 
-	int max_pages = 131072;  /* 512MB / 4KB = 131072 页 */
+	int max_pages = 196608;  /* 768MB / 4KB = 196608 页 */
 
 	down_read(&zram->init_lock);
 	if (!init_done(zram) || !zram->backing_dev) {
@@ -4024,10 +4024,26 @@ static unsigned long zram_shrinker_scan(struct shrinker *shrinker, struct shrink
     if (!zram->backing_dev || !gfp_has_io_fs(sc->gfp_mask))
         return SHRINK_STOP;
 
-    if (atomic_read(&zram->shrinker_in_active_period) &&
-        zram->shrinker_active_start == 0) {
-        zram->shrinker_active_start = jiffies;
+    if (get_zram_usage(zram) > 60) {
+        return SHRINK_STOP;
     }
+
+    if (atomic_read(&zram->shrinker_in_active_period)) {
+        if (zram->shrinker_active_start == 0) {
+            zram->shrinker_active_start = jiffies;
+        } else {
+            unsigned long elapsed = jiffies - zram->shrinker_active_start;
+            unsigned long window_jiffies = msecs_to_jiffies(sysctl_zram_shrinker_active_window_ms);
+
+            if (elapsed > window_jiffies) {
+                atomic_set(&zram->shrinker_in_active_period, 0);
+                return SHRINK_STOP;
+            }
+        }
+    } else {
+        return SHRINK_STOP;
+    }
+
     /*
      * Phase 1: 分配工作上下文
      */
@@ -4108,6 +4124,11 @@ out:
 static unsigned long zram_shrinker_count(struct shrinker *shrinker, struct shrink_control *sc)
 {
     struct zram *zram = shrinker->private_data;
+
+    if (get_zram_usage(zram) > 60) {
+        return 0;
+    }
+
     if (!zram->backing_dev || !gfp_has_io_fs(sc->gfp_mask)) {
         return 0;
 	}
