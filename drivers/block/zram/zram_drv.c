@@ -424,12 +424,12 @@ static void zram_accessed(struct zram *zram, u32 index)
 }
 
 #if defined CONFIG_ZRAM_WRITEBACK || defined CONFIG_ZRAM_MULTI_COMP
-static struct zram_pp_ctl *init_pp_ctl_timeout(unsigned long timeout_ms)
+static struct zram_pp_ctl *init_pp_ctl_timeout(unsigned long timeout_ms, gfp_t gfp_mask)
 {
 	struct zram_pp_ctl *ctl;
 	u32 idx;
 
-	ctl = kmalloc(sizeof(*ctl), GFP_KERNEL);
+	ctl = kmalloc(sizeof(*ctl), gfp_mask);
 	if (!ctl)
 		return NULL;
 
@@ -448,7 +448,7 @@ static struct zram_pp_ctl *init_pp_ctl_timeout(unsigned long timeout_ms)
 
 static struct zram_pp_ctl *init_pp_ctl(void)
 {
-	return init_pp_ctl_timeout(0);
+	return init_pp_ctl_timeout(0, GFP_KERNEL);
 }
 
 static void remove_pp_slot_from_ctl(struct zram_pp_slot *pps)
@@ -641,12 +641,14 @@ static ssize_t mem_used_max_store(struct device *dev,
 static void mark_idle(struct zram *zram, ktime_t cutoff, int max_scan)
 {
 	struct zram_table_entry *entry;
-	LIST_HEAD(temp_dispose_list);
+	unsigned long index_array[MARK_IDLE_BATCH_SIZE];
+	int nr_indices = 0;
 	int scanned = 0;
 	int marked_idle = 0;
 	unsigned long active_total;
 	int target_scan;
 	int batch_count = 0;
+	int i;
 
 	zram_drain_all_pages(zram);
 
@@ -706,7 +708,9 @@ static void mark_idle(struct zram *zram, ktime_t cutoff, int max_scan)
 		atomic_long_dec(&zram->active_pages);
 		marked_idle++;
 		
-		list_move(&entry->lru, &temp_dispose_list);
+		/* 保存 index 而不是移动到临时链表 */
+		index_array[nr_indices++] = index;
+		list_del_init(&entry->lru);
 		
 		zram_slot_unlock(zram, index);
 		
@@ -715,11 +719,11 @@ check_batch:
 			spin_unlock(&zram->active_list_lock);
 			
 			/* 在不持锁期间处理已移出的页面 */
-			while (!list_empty(&temp_dispose_list)) {
-				entry = list_first_entry(&temp_dispose_list, struct zram_table_entry, lru);
-				list_del_init(&entry->lru);
+			for (i = 0; i < nr_indices; i++) {
+				entry = &zram->table[index_array[i]];
 				zram_lru_add(zram, entry);
 			}
+			nr_indices = 0;
 			
 			cond_resched();
 			batch_count = 0;
@@ -730,9 +734,8 @@ check_batch:
 	spin_unlock(&zram->active_list_lock);
 	
 	/* 批量将冷页面移入 zram_list_lru */
-	while (!list_empty(&temp_dispose_list)) {
-		entry = list_first_entry(&temp_dispose_list, struct zram_table_entry, lru);
-		list_del_init(&entry->lru);
+	for (i = 0; i < nr_indices; i++) {
+		entry = &zram->table[index_array[i]];
 		zram_lru_add(zram, entry);
 	}
 	
@@ -2866,7 +2869,7 @@ static ssize_t disksize_store(struct device *dev,
 
 #ifdef CONFIG_ZRAM_AUTO_SIZE
 	if (sysfs_streq(buf, "auto")) {
-        unsigned long total_mem = (u64)totalram_pages() << PAGE_SHIFT; // 总物理内存
+        u64 total_mem = (u64)totalram_pages() << PAGE_SHIFT; // 总物理内存
         unsigned int num_cores = num_online_cpus(); // 在线 CPU 核心数
         u64 base_ratio;
 		u64 target_size;
@@ -2874,7 +2877,7 @@ static ssize_t disksize_store(struct device *dev,
 
         // 1. 优化 base_ratio 的计算：确保 8 核时达到 100%
         // 每个核心贡献 13%，上限 100%
-        base_ratio = min(num_cores * 13ULL, 100ULL); 
+        base_ratio = min_t(u64, num_cores * 13ULL, 100ULL); 
         
         // 计算基于内存和核心数的初始目标大小
         target_size = div64_ul(total_mem * base_ratio, 100ULL);
@@ -2898,9 +2901,9 @@ static ssize_t disksize_store(struct device *dev,
 
         // 4. 调整 clamp 范围：允许 Zram 大小超过物理内存
         // 最小 Zram 1GB，或总内存的 1/8 （取两者最大值）
-        u64 min_allowed_size = max(1ULL * 1024 * 1024 * 1024ULL, div64_ul(total_mem, 8ULL)); 
+        u64 min_allowed_size = max_t(u64, 1ULL * 1024 * 1024 * 1024ULL, div64_ul(total_mem, 8ULL)); 
         // 最大 Zram 可以是 64GB，或总内存的 2 倍（取两者最小值）
-        u64 max_allowed_size = min(64ULL * 1024 * 1024 * 1024ULL, total_mem * 2ULL); 
+        u64 max_allowed_size = min_t(u64, 64ULL * 1024 * 1024 * 1024ULL, total_mem * 2ULL); 
         
         // 确保最小不会超过最大
         if (min_allowed_size > max_allowed_size) {
@@ -2909,7 +2912,7 @@ static ssize_t disksize_store(struct device *dev,
 
         target_size = clamp(target_size, min_allowed_size, max_allowed_size);
         
-        pr_info("zram: auto-calculated disksize: %llu (mem: %luGB, cores: %u, pressure: %u:%u, factor: %llu%%)\n",
+        pr_info("zram: auto-calculated disksize: %llu (mem: %lluGB, cores: %u, pressure: %u:%u, factor: %llu%%)\n",
                 target_size, total_mem >> 30, num_cores, mem_pressure, zram_pressure, combined_pressure_factor_percent);
 
 		disksize = target_size;
@@ -3615,7 +3618,7 @@ static int zram_proactive_writeback(struct zram *zram, unsigned long timeout_ms)
 	}
 
 	/* 使用带超时的初始化 */
-	ctl = init_pp_ctl_timeout(timeout_ms);
+	ctl = init_pp_ctl_timeout(timeout_ms, GFP_KERNEL);
 	if (!ctl) {
 		up_read(&zram->init_lock);
 		return -ENOMEM;
@@ -3931,8 +3934,7 @@ static enum lru_status zram_seed_collect_cb(struct list_head *item, struct list_
     /* 3. 收集种子 */
     work->candidates[work->nr_candidates++] = index;
 
-	// 这里不能轮转,会导致冷页面跑到热端
-    return LRU_SKIP;
+    return LRU_ROTATE;
 }
 
 /* 
@@ -4032,7 +4034,7 @@ static unsigned long zram_shrinker_scan(struct shrinker *shrinker, struct shrink
     memset(work, 0, sizeof(*work));
 
     work->zram = zram;
-    work->ctl = init_pp_ctl();
+    work->ctl = init_pp_ctl_timeout(0, GFP_NOWAIT | __GFP_NOWARN);
     if (!work->ctl)
         return SHRINK_STOP;
 

@@ -43,10 +43,16 @@ static unsigned long alloc_block_bdev_range(struct zram *zram, int count)
 	spin_lock(&zram->bitmap_lock);
 
 	blk_idx = bitmap_find_next_zero_area(zram->bitmap, zram->nr_pages,
-					     1, count, align_mask);
+					     zram->bitmap_last_free_hint, count, align_mask);
+
+	if (blk_idx >= zram->nr_pages && zram->bitmap_last_free_hint > 0) {
+		blk_idx = bitmap_find_next_zero_area(zram->bitmap, zram->nr_pages,
+						     1, count, align_mask);
+	}
 
 	if (blk_idx < zram->nr_pages) {
 		bitmap_set(zram->bitmap, blk_idx, count);
+		zram->bitmap_last_free_hint = blk_idx + count;
 	} else {
 		blk_idx = 0;
 	}
@@ -96,6 +102,8 @@ void free_block_bdev_range(struct zram *zram, unsigned long blk_idx, int count)
 {
 	spin_lock(&zram->bitmap_lock);
 	bitmap_clear(zram->bitmap, blk_idx, count);
+	if (blk_idx < zram->bitmap_last_free_hint)
+		zram->bitmap_last_free_hint = blk_idx;
 	spin_unlock(&zram->bitmap_lock);
 
 	percpu_counter_sub(&zram->stats.bd_count, count);

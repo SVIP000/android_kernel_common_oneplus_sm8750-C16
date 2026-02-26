@@ -163,6 +163,7 @@ struct zram {
 	unsigned long *bitmap;
 	unsigned long nr_pages;
 	spinlock_t bitmap_lock;  /* 保护 bitmap 的分配与释放 */
+	unsigned long bitmap_last_free_hint;
 	struct shrinker *zram_shrinker;
 	/* Global LRU list for zram entries. */
 	struct list_lru zram_list_lru;
