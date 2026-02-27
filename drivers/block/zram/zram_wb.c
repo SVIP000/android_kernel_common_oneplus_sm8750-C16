@@ -66,24 +66,39 @@ static unsigned long alloc_block_bdev_range(struct zram *zram, int count)
 }
 
 /*
- * 实现 TODO 1.2: 分配降级策略
+ * 实现 TODO 1.2: 分配降级策略（优化版）
+ * 
+ * 修复：避免碎片化严重时进行多次全位图扫描
+ * 原策略：尝试 64, 32, 16, 8, 4, 2, 1 共7次扫描
+ * 新策略：只尝试最优情况(请求的大小)和保底情况(1块)
+ * 
  * req_count: 请求分配的块数 (例如 64)
  * act_count: 输出参数，实际分配的块数
  */
 unsigned long alloc_block_bdev_batch(struct zram *zram, int req_count, int *act_count)
 {
-    static const int FALLBACK_SIZES[] = {64, 32, 16, 8, 4, 2, 1};
-    int i;
+    unsigned long blk_idx = 0;
 
-    for (i = 0; i < ARRAY_SIZE(FALLBACK_SIZES); i++) {
-        int try_count = FALLBACK_SIZES[i];
-        if (try_count > req_count) continue;   // 不超过请求量
-
-        unsigned long blk_idx = alloc_block_bdev_range(zram, try_count);
+    if (req_count <= 1) {
+        blk_idx = alloc_block_bdev_range(zram, 1);
         if (blk_idx) {
-            if (act_count) *act_count = try_count;
+            if (act_count) *act_count = 1;
             return blk_idx;
         }
+        if (act_count) *act_count = 0;
+        return 0;
+    }
+
+    blk_idx = alloc_block_bdev_range(zram, req_count);
+    if (blk_idx) {
+        if (act_count) *act_count = req_count;
+        return blk_idx;
+    }
+
+    blk_idx = alloc_block_bdev_range(zram, 1);
+    if (blk_idx) {
+        if (act_count) *act_count = 1;
+        return blk_idx;
     }
 
     if (act_count) *act_count = 0;

@@ -1096,13 +1096,6 @@ static int zram_writeback_slots(struct zram *zram, struct zram_pp_ctl *ctl, bool
 				active_req = NULL;
 			}
 			release_pp_slot(zram, pps);
-			if (async) {
-				if (++fail_streak > 5) {
-					ret = 0;
-					break;
-				}
-				continue;
-			}
 			ret = -ENOMEM;
 			break;
 		}
