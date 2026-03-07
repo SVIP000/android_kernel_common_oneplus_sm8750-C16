@@ -2931,6 +2931,7 @@ repeat:
 		struct pool_workqueue *pwq = list_first_entry(&wq->maydays,
 					struct pool_workqueue, mayday_node);
 		struct worker_pool *pool = pwq->pool;
+		unsigned int count = 0;
 
 		__set_current_state(TASK_RUNNING);
 		list_del_init(&pwq->mayday_node);
@@ -2942,19 +2943,16 @@ repeat:
 		raw_spin_lock_irq(&pool->lock);
 
 		WARN_ON_ONCE(!list_empty(&rescuer->scheduled));
-		if (assign_rescuer_work(pwq, rescuer)) {
+		while (assign_rescuer_work(pwq, rescuer)) {
 			process_scheduled_works(rescuer);
 
 			/*
-			 * The above execution of rescued work items could
-			 * have created more to rescue through
-			 * pwq_activate_first_inactive() or chained
-			 * queueing.  Let's put @pwq back on mayday list so
-			 * that such back-to-back work items, which may be
-			 * being used to relieve memory pressure, don't
-			 * incur MAYDAY_INTERVAL delay inbetween.
+			 * If the per-turn work item limit is reached and other
+			 * PWQs are in mayday, requeue mayday for this PWQ and
+			 * let the rescuer handle the other PWQs first.
 			 */
-			if (pwq->nr_active && need_to_create_worker(pool)) {
+			 if (++count > RESCUER_BATCH && !list_empty(&pwq->wq->maydays) &&
+			 pwq->nr_active && need_to_create_worker(pool)) {
 				raw_spin_lock(&wq_mayday_lock);
 				/*
 				 * Queue iff we aren't racing destruction
@@ -2965,8 +2963,13 @@ repeat:
 					list_add_tail(&pwq->mayday_node, &wq->maydays);
 				}
 				raw_spin_unlock(&wq_mayday_lock);
+				break;
 			}
 		}
+
+		/* The cursor can not be left behind without the rescuer watching it. */
+		if (!list_empty(&pwq->mayday_cursor.entry) && list_empty(&pwq->mayday_node))
+			list_del_init(&pwq->mayday_cursor.entry);
 
 		/*
 		 * Put the reference grabbed by send_mayday().  @pool won't
@@ -4300,6 +4303,18 @@ static void init_pwq(struct pool_workqueue *pwq, struct workqueue_struct *wq,
 	INIT_LIST_HEAD(&pwq->pwqs_node);
 	INIT_LIST_HEAD(&pwq->mayday_node);
 	kthread_init_work(&pwq->release_work, pwq_release_workfn);
+	/*
+	 * Set the dummy cursor work with valid function and get_work_pwq().
+	 *
+	 * The cursor work should only be in the pwq->pool->worklist, and
+	 * should not be treated as a processable work item.
+	 *
+	 * WORK_STRUCT_PENDING and WORK_STRUCT_INACTIVE just make it less
+	 * surprise for kernel debugging tools and reviewers.
+	 */
+	 INIT_WORK(&pwq->mayday_cursor, mayday_cursor_func);
+	 atomic_long_set(&pwq->mayday_cursor.data, (unsigned long)pwq |
+			 WORK_STRUCT_PENDING | WORK_STRUCT_PWQ | WORK_STRUCT_INACTIVE);
 }
 
 /* sync @pwq with the current state of its associated wq and link it */
