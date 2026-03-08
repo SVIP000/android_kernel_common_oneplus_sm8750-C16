@@ -9,6 +9,7 @@
 #include <linux/wait.h>
 #include <linux/freezer.h>
 #include <linux/blkdev.h>
+#include <linux/bitops.h>
 
 #include "zram_wb.h"
 
@@ -30,27 +31,35 @@ static struct bio_set zram_wb_bs;
 #define bio_to_wb_batch(bio) \
 	((struct zram_wb_batch_request *)((char *)(bio) - ZRAM_WB_FRONT_PAD))
 
-/* 
- * 内部辅助函数：分配指定长度的连续区间
- * 使用 spinlock 保护，避免批量分配时的 retry 风暴
- * 返回值：成功返回起始索引，失败返回 0
+/*
+ * O(1) 复杂度的后备设备块批量分配
+ * req_count: 请求分配的块数 (例如 64)
+ * act_count: 输出参数，实际分配的块数
  */
-static unsigned long alloc_block_bdev_range(struct zram *zram, int count)
+unsigned long alloc_block_bdev_batch(struct zram *zram, int req_count, int *act_count)
 {
 	unsigned long blk_idx;
-	unsigned long align_mask = (unsigned long)count - 1;
+	int count = 0;
 
 	spin_lock(&zram->bitmap_lock);
 
+	/* 寻找第一个空闲块（不要求对齐），强制从索引 1 开始以避开 block 0 */
 	blk_idx = bitmap_find_next_zero_area(zram->bitmap, zram->nr_pages,
-					     zram->bitmap_last_free_hint, count, align_mask);
+					     max(zram->bitmap_last_free_hint, 1UL), 1, 0);
 
-	if (blk_idx >= zram->nr_pages && zram->bitmap_last_free_hint > 0) {
+	if (blk_idx >= zram->nr_pages && zram->bitmap_last_free_hint > 1) {
 		blk_idx = bitmap_find_next_zero_area(zram->bitmap, zram->nr_pages,
-						     1, count, align_mask);
+						     1, 1, 0);
 	}
 
 	if (blk_idx < zram->nr_pages) {
+		/* 向后探测连续空闲块 */
+		count = 1;
+		while (count < req_count && (blk_idx + count) < zram->nr_pages &&
+		       !test_bit(blk_idx + count, zram->bitmap)) {
+			count++;
+		}
+		
 		bitmap_set(zram->bitmap, blk_idx, count);
 		zram->bitmap_last_free_hint = blk_idx + count;
 	} else {
@@ -59,50 +68,16 @@ static unsigned long alloc_block_bdev_range(struct zram *zram, int count)
 
 	spin_unlock(&zram->bitmap_lock);
 
-	if (blk_idx)
+	if (blk_idx) {
 		percpu_counter_add(&zram->stats.bd_count, count);
+		if (act_count)
+			*act_count = count;
+	} else {
+		if (act_count)
+			*act_count = 0;
+	}
 
 	return blk_idx;
-}
-
-/*
- * 实现 TODO 1.2: 分配降级策略（优化版）
- * 
- * 修复：避免碎片化严重时进行多次全位图扫描
- * 原策略：尝试 64, 32, 16, 8, 4, 2, 1 共7次扫描
- * 新策略：只尝试最优情况(请求的大小)和保底情况(1块)
- * 
- * req_count: 请求分配的块数 (例如 64)
- * act_count: 输出参数，实际分配的块数
- */
-unsigned long alloc_block_bdev_batch(struct zram *zram, int req_count, int *act_count)
-{
-    unsigned long blk_idx = 0;
-
-    if (req_count <= 1) {
-        blk_idx = alloc_block_bdev_range(zram, 1);
-        if (blk_idx) {
-            if (act_count) *act_count = 1;
-            return blk_idx;
-        }
-        if (act_count) *act_count = 0;
-        return 0;
-    }
-
-    blk_idx = alloc_block_bdev_range(zram, req_count);
-    if (blk_idx) {
-        if (act_count) *act_count = req_count;
-        return blk_idx;
-    }
-
-    blk_idx = alloc_block_bdev_range(zram, 1);
-    if (blk_idx) {
-        if (act_count) *act_count = 1;
-        return blk_idx;
-    }
-
-    if (act_count) *act_count = 0;
-    return 0;
 }
 
 /* 保持原有单块分配函数的兼容性 */
@@ -142,6 +117,7 @@ static void complete_wb_batch(struct zram_wb_batch_request *req)
 	struct bio *bio = req->bio;
 	bool io_error = bio->bi_status != BLK_STS_OK;
 	int i;
+	int success_count = 0;
 
 	/* 遍历批次中的每一个子请求 */
 	for (i = 0; i < req->count; i++) {
@@ -153,15 +129,10 @@ static void complete_wb_batch(struct zram_wb_batch_request *req)
 		if (io_error)
 			goto handle_err;
 
-		/* 更新统计 */
-		percpu_counter_inc(&zram->stats.bd_writes);
-		spin_lock(&zram->wb_limit_lock);
-
 		/* 锁定槽位进行状态变更 */
 		zram_slot_lock(zram, index);
 		if (!zram_test_flag(zram, index, ZRAM_PP_SLOT)) {
 			zram_slot_unlock(zram, index);
-			spin_unlock(&zram->wb_limit_lock);
 			goto handle_err;
 		}
 
@@ -169,16 +140,11 @@ static void complete_wb_batch(struct zram_wb_batch_request *req)
 		zram_free_page(zram, index);
 		zram_set_flag(zram, index, ZRAM_WB);
 		zram_set_handle(zram, index, blk_idx);
-		percpu_counter_inc(&zram->stats.pages_stored);
-
-		/* 更新写回限制配额 */
-		if (zram->wb_limit_enable && zram->bd_wb_limit > 0)
-			zram->bd_wb_limit -=  1UL << (PAGE_SHIFT - 12);
 
 		zram_clear_flag(zram, index, ZRAM_PP_SLOT);
 		zram_slot_unlock(zram, index);
-		spin_unlock(&zram->wb_limit_lock);
 		
+		success_count++;
 		kfree(pps);
 		continue;
 
@@ -186,6 +152,21 @@ handle_err:
 		/* 失败路径：回滚块分配，保留 ZRAM 内存页 */
 		free_block_bdev(zram, blk_idx);
 		free_pp_slot(zram, pps);
+	}
+
+	if (success_count > 0) {
+		percpu_counter_add(&zram->stats.bd_writes, success_count);
+		percpu_counter_add(&zram->stats.pages_stored, success_count);
+		
+		spin_lock(&zram->wb_limit_lock);
+		if (zram->wb_limit_enable && zram->bd_wb_limit > 0) {
+			u64 decrement = (u64)success_count * (1UL << (PAGE_SHIFT - 12));
+			if (zram->bd_wb_limit >= decrement)
+				zram->bd_wb_limit -= decrement;
+			else
+				zram->bd_wb_limit = 0;
+		}
+		spin_unlock(&zram->wb_limit_lock);
 	}
 
 	/*

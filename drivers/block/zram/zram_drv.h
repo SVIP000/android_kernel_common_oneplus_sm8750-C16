@@ -42,9 +42,6 @@
  */
 #define ZRAM_FLAG_SHIFT (PAGE_SHIFT + 1)
 
-/* Only 2 bits are allowed for comp priority index */
-#define ZRAM_COMP_PRIORITY_MASK	0x3
-
 /* Flags for zram pages (table[page_no].flags) */
 enum zram_pageflags {
 	/* zram slot is locked */
@@ -55,9 +52,6 @@ enum zram_pageflags {
 	ZRAM_HUGE,	/* Incompressible page */
 	ZRAM_IDLE,	/* not accessed page since last idle marking */
 	ZRAM_INCOMPRESSIBLE, /* none of the algorithms could compress it */
-
-	ZRAM_COMP_PRIORITY_BIT1, /* First bit of comp priority index */
-	ZRAM_COMP_PRIORITY_BIT2, /* Second bit of comp priority index */
 
 	ZRAM_REFERENCED, /* Page was referenced since last shrinker scan */
 	ZRAM_ACTIVE, /* Page is in active list (percpu_pagevec or active_list) */
@@ -80,7 +74,7 @@ struct zram_table_entry {
 };
 
 #ifdef CONFIG_ZRAM_WRITEBACK
-#define BATCH_SIZE 32
+#define BATCH_SIZE 64
 #define WINDOW_RADIUS 8
 #define MIN_AGGREGATE 4
 #define ZRAM_PAGEVEC_SIZE 128
@@ -97,6 +91,25 @@ struct zram_shrink_work {
     struct zram_pp_ctl *ctl;              /* 写回控制器 */
 };
 #endif
+
+/* Hot page cache: avoids repeated decompression for frequently accessed pages */
+#define ZRAM_HC_SHIFT		7
+#define ZRAM_HC_SIZE		(1 << ZRAM_HC_SHIFT)
+#define ZRAM_HC_MASK		(ZRAM_HC_SIZE - 1)
+#define ZRAM_READ_BATCH_MAX	8
+
+struct zram_hc_entry {
+	spinlock_t lock;
+	u32 index;
+	struct page *page;
+	bool referenced;
+};
+
+struct zram_hot_cache {
+	struct zram_hc_entry entries[ZRAM_HC_SIZE];
+	atomic_long_t hits;
+	atomic_long_t misses;
+};
 
 struct zram_stats {
 	struct percpu_counter compr_data_size;	/* compressed size of pages stored */
@@ -119,41 +132,21 @@ struct zram_stats {
 #endif
 };
 
-#ifdef CONFIG_ZRAM_MULTI_COMP
-#define ZRAM_PRIMARY_COMP	0U
-#define ZRAM_SECONDARY_COMP	1U
-#define ZRAM_MAX_COMPS	4U
-#else
-#define ZRAM_PRIMARY_COMP	0U
-#define ZRAM_SECONDARY_COMP	0U
-#define ZRAM_MAX_COMPS	1U
-#endif
-
 struct zram {
 	struct zram_table_entry *table;
 	struct zs_pool *mem_pool;
-	struct zcomp *comps[ZRAM_MAX_COMPS];
+	struct zcomp *comp;
 	struct gendisk *disk;
-	/* Prevent concurrent execution of device init */
 	struct rw_semaphore init_lock;
-	/*
-	 * the number of pages zram can consume for storing compressed data
-	 */
 	unsigned long limit_pages;
 
 	struct zram_stats stats;
-	/*
-	 * This is the limit on amount of *uncompressed* worth of data
-	 * we can store in a disk.
-	 */
-	u64 disksize;	/* bytes */
-	const char *comp_algs[ZRAM_MAX_COMPS];
-	s8 num_active_comps;
-	/*
-	 * zram is claimed so open request will be failed
-	 */
-	bool claim; /* Protected by disk->open_mutex */
+	u64 disksize;
+	const char *comp_alg;
+	bool claim;
+	struct bio_set zram_bio_set;
 	mempool_t *io_page_pool;
+	struct zram_hot_cache hot_cache;
 #ifdef CONFIG_ZRAM_WRITEBACK
 	struct file *backing_dev;
 	spinlock_t wb_limit_lock;
@@ -162,10 +155,9 @@ struct zram {
 	struct block_device *bdev;
 	unsigned long *bitmap;
 	unsigned long nr_pages;
-	spinlock_t bitmap_lock;  /* 保护 bitmap 的分配与释放 */
+	spinlock_t bitmap_lock;
 	unsigned long bitmap_last_free_hint;
 	struct shrinker *zram_shrinker;
-	/* Global LRU list for zram entries. */
 	struct list_lru zram_list_lru;
 	mempool_t *wb_page_pool;
 	unsigned long shrinker_active_start;
@@ -173,7 +165,7 @@ struct zram {
 	struct zram_pagevec __percpu *active_pagevecs;
 	struct list_head active_list;
 	spinlock_t active_list_lock;
-	atomic_long_t active_pages;  /* 实时追踪活跃链表长度 */
+	atomic_long_t active_pages;
 #endif
 #ifdef CONFIG_ZRAM_MEMORY_TRACKING
 	struct dentry *debugfs_dir;
@@ -194,7 +186,7 @@ void zram_set_flag(struct zram *zram, u32 index, enum zram_pageflags flag);
 void zram_clear_flag(struct zram *zram, u32 index, enum zram_pageflags flag);
 void zram_free_page(struct zram *zram, size_t index);
 
-#if defined CONFIG_ZRAM_WRITEBACK || defined CONFIG_ZRAM_MULTI_COMP
+#ifdef CONFIG_ZRAM_WRITEBACK
 struct zram_pp_slot {
 	unsigned long		index;
 	struct list_head	entry;
