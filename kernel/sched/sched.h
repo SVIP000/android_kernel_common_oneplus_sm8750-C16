@@ -2517,7 +2517,7 @@ extern void update_max_interval(void);
 extern void init_sched_dl_class(void);
 extern void init_sched_rt_class(void);
 extern void init_sched_fair_class(void);
-
+extern void set_load_weight(struct task_struct *p, bool update_load);
 extern void reweight_task(struct task_struct *p, int prio);
 extern bool __dequeue_task(struct rq *rq, struct task_struct *p, int flags);
 extern void dequeue_task(struct rq *rq, struct task_struct *p, int flags);
