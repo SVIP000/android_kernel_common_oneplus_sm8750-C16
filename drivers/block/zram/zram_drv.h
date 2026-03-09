@@ -92,24 +92,7 @@ struct zram_shrink_work {
 };
 #endif
 
-/* Hot page cache: avoids repeated decompression for frequently accessed pages */
-#define ZRAM_HC_SHIFT		7
-#define ZRAM_HC_SIZE		(1 << ZRAM_HC_SHIFT)
-#define ZRAM_HC_MASK		(ZRAM_HC_SIZE - 1)
-#define ZRAM_READ_BATCH_MAX	8
-
-struct zram_hc_entry {
-	spinlock_t lock;
-	u32 index;
-	struct page *page;
-	bool referenced;
-};
-
-struct zram_hot_cache {
-	struct zram_hc_entry entries[ZRAM_HC_SIZE];
-	atomic_long_t hits;
-	atomic_long_t misses;
-};
+#define ZRAM_READ_BATCH_MAX	16
 
 struct zram_stats {
 	struct percpu_counter compr_data_size;	/* compressed size of pages stored */
@@ -146,7 +129,6 @@ struct zram {
 	bool claim;
 	struct bio_set zram_bio_set;
 	mempool_t *io_page_pool;
-	struct zram_hot_cache hot_cache;
 #ifdef CONFIG_ZRAM_WRITEBACK
 	struct file *backing_dev;
 	spinlock_t wb_limit_lock;
