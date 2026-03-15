@@ -405,6 +405,8 @@ static void bio_associate_blkg_from_page(struct bio *bio, struct folio *folio)
 
 struct swap_iocb {
 	struct kiocb		iocb;
+	struct block_device	*bdev;
+	sector_t		sector;
 	struct bio_vec		bvec[SWAP_CLUSTER_MAX];
 	int			pages;
 	int			len;
@@ -595,6 +597,28 @@ static void sio_read_complete(struct kiocb *iocb, long ret)
 	mempool_free(sio, sio_pool);
 }
 
+static void end_swap_bio_read_multi(struct bio *bio)
+{
+	struct swap_iocb *sio = bio->bi_private;
+	struct folio_iter fi;
+
+	if (bio->bi_status) {
+		pr_alert_ratelimited("Read-error on swap-device (%u:%u:%llu)\n",
+				     MAJOR(bio_dev(bio)), MINOR(bio_dev(bio)),
+				     (unsigned long long)bio->bi_iter.bi_sector);
+		bio_for_each_folio_all(fi, bio)
+			folio_unlock(fi.folio);
+	} else {
+		bio_for_each_folio_all(fi, bio) {
+			folio_mark_uptodate(fi.folio);
+			folio_unlock(fi.folio);
+		}
+	}
+
+	bio_put(bio);
+	mempool_free(sio, sio_pool);
+}
+
 static void swap_readpage_fs(struct page *page,
 			     struct swap_iocb **plug)
 {
@@ -614,6 +638,8 @@ static void swap_readpage_fs(struct page *page,
 	if (!sio) {
 		sio = mempool_alloc(sio_pool, GFP_KERNEL);
 		init_sync_kiocb(&sio->iocb, sis->swap_file);
+		sio->bdev = NULL;
+		sio->sector = 0;
 		sio->iocb.ki_pos = pos;
 		sio->iocb.ki_complete = sio_read_complete;
 		sio->pages = 0;
@@ -673,14 +699,56 @@ static void swap_readpage_bdev_sync(struct folio *folio,
 }
 
 static void swap_readpage_bdev_async(struct folio *folio,
-		struct swap_info_struct *sis)
+		struct swap_info_struct *sis, struct swap_iocb **plug)
 {
 	struct bio *bio;
+	struct swap_iocb *sio = NULL;
+	sector_t sector = swap_page_sector(&folio->page);
+	int size = folio_size(folio);
 
+	if (unlikely(!sio_pool) && sio_pool_init())
+		goto fallback_single;
+
+	if (plug)
+		sio = *plug;
+	if (sio) {
+		if (sio->bdev != sis->bdev ||
+		    sio->sector + (sio->len >> SECTOR_SHIFT) != sector) {
+			swap_read_unplug(sio);
+			sio = NULL;
+		}
+	}
+
+	if (!sio) {
+		sio = mempool_alloc(sio_pool, GFP_KERNEL);
+		if (!sio)
+			goto fallback_single;
+
+		sio->bdev = sis->bdev;
+		sio->sector = sector;
+		sio->pages = 0;
+		sio->len = 0;
+	}
+
+	bvec_set_page(&sio->bvec[sio->pages], &folio->page, size, 0);
+	sio->len += size;
+	sio->pages += 1;
+	count_vm_events(PSWPIN, folio_nr_pages(folio));
+	if (sio->pages == ARRAY_SIZE(sio->bvec) || !plug) {
+		swap_read_unplug(sio);
+		sio = NULL;
+	}
+
+	if (plug)
+		*plug = sio;
+
+	return;
+
+fallback_single:
 	bio = bio_alloc(sis->bdev, 1, REQ_OP_READ, GFP_KERNEL);
-	bio->bi_iter.bi_sector = swap_page_sector(&folio->page);
+	bio->bi_iter.bi_sector = sector;
 	bio->bi_end_io = end_swap_bio_read;
-	bio_add_folio_nofail(bio, folio, folio_size(folio), 0);
+	bio_add_folio_nofail(bio, folio, size, 0);
 	count_vm_events(PSWPIN, folio_nr_pages(folio));
 	submit_bio(bio);
 }
@@ -716,7 +784,7 @@ void swap_readpage(struct page *page, bool synchronous, struct swap_iocb **plug)
 	} else if (synchronous || (sis->flags & SWP_SYNCHRONOUS_IO)) {
 		swap_readpage_bdev_sync(folio, sis);
 	} else {
-		swap_readpage_bdev_async(folio, sis);
+		swap_readpage_bdev_async(folio, sis, plug);
 	}
 
 	if (workingset) {
@@ -728,6 +796,33 @@ void swap_readpage(struct page *page, bool synchronous, struct swap_iocb **plug)
 
 void __swap_read_unplug(struct swap_iocb *sio)
 {
+	if (sio->bdev) {
+		struct bio *bio;
+		int i;
+
+		bio = bio_alloc(sio->bdev, sio->pages, REQ_OP_READ, GFP_KERNEL);
+		bio->bi_iter.bi_sector = sio->sector;
+		bio->bi_end_io = end_swap_bio_read_multi;
+		bio->bi_private = sio;
+
+		for (i = 0; i < sio->pages; i++) {
+			if (bio_add_page(bio, sio->bvec[i].bv_page,
+					 sio->bvec[i].bv_len,
+					 sio->bvec[i].bv_offset) < sio->bvec[i].bv_len) {
+				pr_alert_ratelimited("swap_read_unplug: failed to build bdev read bio (%u:%u:%llu)\n",
+						     MAJOR(sio->bdev->bd_dev),
+						     MINOR(sio->bdev->bd_dev),
+						     (unsigned long long)sio->sector);
+				bio->bi_status = BLK_STS_IOERR;
+				end_swap_bio_read_multi(bio);
+				return;
+			}
+		}
+
+		submit_bio(bio);
+		return;
+	}
+
 	struct iov_iter from;
 	struct address_space *mapping = sio->iocb.ki_filp->f_mapping;
 	int ret;

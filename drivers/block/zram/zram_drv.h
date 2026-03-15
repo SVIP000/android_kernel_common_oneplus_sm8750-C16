@@ -76,6 +76,7 @@ struct zram_table_entry {
 #ifdef CONFIG_ZRAM_WRITEBACK
 #define BATCH_SIZE 64
 #define WINDOW_RADIUS 8
+#define ZRAM_WINDOW_CLAIMED_SIZE (WINDOW_RADIUS * 2 + 1)
 #define MIN_AGGREGATE 4
 #define ZRAM_PAGEVEC_SIZE 128
 struct zram_pagevec {
@@ -86,9 +87,10 @@ struct zram_pagevec {
 
 struct zram_shrink_work {
     struct zram *zram;
-    unsigned long candidates[BATCH_SIZE]; /* 候选页面索引数组 */
-    int nr_candidates;                    /* 当前收集数量 */
     struct zram_pp_ctl *ctl;              /* 写回控制器 */
+    int nr_candidates;                    /* 当前收集数量 */
+    unsigned long candidates[BATCH_SIZE]; /* 候选页面索引数组 */
+    unsigned long window_claimed[ZRAM_WINDOW_CLAIMED_SIZE];
 };
 #endif
 
@@ -110,8 +112,6 @@ struct zram_stats {
 	struct percpu_counter bd_count;		/* no. of pages in backing device */
 	struct percpu_counter bd_reads;		/* no. of reads from backing device */
 	struct percpu_counter bd_writes;		/* no. of writes from backing device */
-	struct percpu_counter written_back_pages;
-	atomic64_t reject_reclaim_fail;
 #endif
 };
 

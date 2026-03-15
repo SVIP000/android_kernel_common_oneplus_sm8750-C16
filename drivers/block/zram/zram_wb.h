@@ -8,6 +8,8 @@
 
 /* 定义最大合并数量 */
 #define ZRAM_WB_MAX_BATCH_SIZE 64
+/* 严格连续分配的最小单位（页） */
+#define ZRAM_WB_MIN_ALLOC_UNIT 4
 
 /* 单个页面请求的元数据 */
 struct zram_wb_sub_req {
@@ -28,6 +30,7 @@ struct zram_wb_batch_request {
 	
 	/* 当前批次中包含的有效子请求数量 */
 	unsigned int count;
+	u64 reserved_wb_units;
 	
 	/* 记录每个页面的元数据，用于回调时释放资源 */
 	struct zram_wb_sub_req sub_reqs[ZRAM_WB_MAX_BATCH_SIZE];
@@ -40,7 +43,6 @@ struct zram_wb_request_list {
 };
 
 #if IS_ENABLED(CONFIG_ZRAM_WRITEBACK)
-unsigned long alloc_block_bdev(struct zram *zram);
 unsigned long alloc_block_bdev_batch(struct zram *zram, int req_count, int *act_count);
 void free_block_bdev(struct zram *zram, unsigned long blk_idx);
 void free_block_bdev_range(struct zram *zram, unsigned long blk_idx, int count);
@@ -53,7 +55,6 @@ struct zram_wb_batch_request *alloc_wb_batch_request(struct zram *zram,
 int setup_zram_writeback(void);
 void destroy_zram_writeback(void);
 #else
-inline unsigned long alloc_block_bdev(struct zram *zram) { return 0; }
 inline unsigned long alloc_block_bdev_batch(struct zram *zram, int req_count, int *act_count) { return 0; }
 inline void free_block_bdev(struct zram *zram, unsigned long blk_idx) {};
 inline void free_block_bdev_range(struct zram *zram, unsigned long blk_idx, int count) {};

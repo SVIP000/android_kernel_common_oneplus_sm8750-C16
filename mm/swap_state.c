@@ -333,6 +333,16 @@ static inline bool swap_use_vma_readahead(void)
 	return READ_ONCE(enable_vma_readahead) && !atomic_read(&nr_rotate_swap);
 }
 
+static inline bool swap_entry_is_zram(swp_entry_t entry)
+{
+	struct swap_info_struct *si = swp_swap_info(entry);
+
+	if (!si || !si->bdev || !si->bdev->bd_disk)
+		return false;
+
+	return !strncmp(si->bdev->bd_disk->disk_name, "zram", 4);
+}
+
 /*
  * Lookup a swap entry in the swap cache. A found folio will be returned
  * unlocked and with its refcount incremented - we rely on the kernel
@@ -639,6 +649,8 @@ struct page *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
 	unsigned long entry_offset = swp_offset(entry);
 	unsigned long offset = entry_offset;
 	unsigned long start_offset, end_offset;
+	unsigned long nr_pages;
+	unsigned long max_pages;
 	unsigned long mask;
 	struct swap_info_struct *si = swp_swap_info(entry);
 	struct blk_plug plug;
@@ -646,8 +658,15 @@ struct page *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
 	bool page_allocated;
 	struct vm_area_struct *vma = vmf->vma;
 	unsigned long addr = vmf->address;
+	bool zram_entry = swap_entry_is_zram(entry);
 
-	mask = swapin_nr_pages(offset) - 1;
+	max_pages = 1UL << READ_ONCE(page_cluster);
+	nr_pages = swapin_nr_pages(offset);
+
+	if (zram_entry && max_pages > 1 && nr_pages == 1)
+		nr_pages = min_t(unsigned long, max_pages, 8);
+
+	mask = nr_pages - 1;
 	if (!mask)
 		goto skip;
 
@@ -868,6 +887,9 @@ skip:
 struct page *swapin_readahead(swp_entry_t entry, gfp_t gfp_mask,
 				struct vm_fault *vmf)
 {
+	if (swap_entry_is_zram(entry))
+		return swap_cluster_readahead(entry, gfp_mask, vmf);
+
 	return swap_use_vma_readahead() ?
 			swap_vma_readahead(entry, gfp_mask, vmf) :
 			swap_cluster_readahead(entry, gfp_mask, vmf);

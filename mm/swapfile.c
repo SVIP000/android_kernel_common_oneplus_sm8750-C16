@@ -39,6 +39,7 @@
 #include <linux/export.h>
 #include <linux/swap_slots.h>
 #include <linux/sort.h>
+#include <linux/string.h>
 #include <linux/completion.h>
 #include <linux/suspend.h>
 #include <linux/zswap.h>
@@ -85,6 +86,14 @@ static const char Bad_file[] = "Bad swap file entry ";
 static const char Unused_file[] = "Unused swap file entry ";
 static const char Bad_offset[] = "Bad swap offset entry ";
 static const char Unused_offset[] = "Unused swap offset entry ";
+
+static bool swap_is_zram_device(struct block_device *bdev)
+{
+	if (!bdev || !bdev->bd_disk)
+		return false;
+
+	return !strncmp(bdev->bd_disk->disk_name, "zram", 4);
+}
 
 /*
  * all active swap_info_structs
@@ -3493,7 +3502,8 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 	if (p->bdev && bdev_stable_writes(p->bdev))
 		p->flags |= SWP_STABLE_WRITES;
 
-	if (p->bdev && bdev_synchronous(p->bdev))
+	if (p->bdev && bdev_synchronous(p->bdev) &&
+	    !swap_is_zram_device(p->bdev))
 		p->flags |= SWP_SYNCHRONOUS_IO;
 
 	if (p->bdev && bdev_nonrot(p->bdev)) {

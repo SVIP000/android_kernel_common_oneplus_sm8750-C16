@@ -39,13 +39,58 @@ static struct bio_set zram_wb_bs;
 unsigned long alloc_block_bdev_batch(struct zram *zram, int req_count, int *act_count)
 {
 	unsigned long blk_idx;
+	unsigned long start;
 	int count = 0;
+	int align_pages;
+	unsigned long align_mask = 0;
 
 	spin_lock(&zram->bitmap_lock);
+	start = max(zram->bitmap_last_free_hint, 1UL);
+	align_pages = (128 * 1024) / PAGE_SIZE;
+	if (align_pages < 1)
+		align_pages = 1;
+	if (align_pages > req_count)
+		align_pages = req_count;
+
+	while (align_pages > 1 && (align_pages & (align_pages - 1)))
+		align_pages &= (align_pages - 1);
+
+	if (align_pages > 1)
+		align_mask = align_pages - 1;
+
+	blk_idx = bitmap_find_next_zero_area(zram->bitmap, zram->nr_pages,
+					     start, req_count,
+					     align_mask);
+	if (blk_idx >= zram->nr_pages && start > 1) {
+		blk_idx = bitmap_find_next_zero_area(zram->bitmap, zram->nr_pages,
+						     1, req_count,
+						     align_mask);
+	}
+
+	if (blk_idx < zram->nr_pages) {
+		count = req_count;
+		bitmap_set(zram->bitmap, blk_idx, count);
+		zram->bitmap_last_free_hint = blk_idx + count;
+		goto out_unlock;
+	}
+
+	/* Try full contiguous extent without alignment constraints. */
+	blk_idx = bitmap_find_next_zero_area(zram->bitmap, zram->nr_pages,
+					     start, req_count, 0);
+	if (blk_idx >= zram->nr_pages && start > 1)
+		blk_idx = bitmap_find_next_zero_area(zram->bitmap, zram->nr_pages,
+						     1, req_count, 0);
+
+	if (blk_idx < zram->nr_pages) {
+		count = req_count;
+		bitmap_set(zram->bitmap, blk_idx, count);
+		zram->bitmap_last_free_hint = blk_idx + count;
+		goto out_unlock;
+	}
 
 	/* 寻找第一个空闲块（不要求对齐），强制从索引 1 开始以避开 block 0 */
 	blk_idx = bitmap_find_next_zero_area(zram->bitmap, zram->nr_pages,
-					     max(zram->bitmap_last_free_hint, 1UL), 1, 0);
+					     start, 1, 0);
 
 	if (blk_idx >= zram->nr_pages && zram->bitmap_last_free_hint > 1) {
 		blk_idx = bitmap_find_next_zero_area(zram->bitmap, zram->nr_pages,
@@ -66,6 +111,7 @@ unsigned long alloc_block_bdev_batch(struct zram *zram, int req_count, int *act_
 		blk_idx = 0;
 	}
 
+	out_unlock:
 	spin_unlock(&zram->bitmap_lock);
 
 	if (blk_idx) {
@@ -78,13 +124,6 @@ unsigned long alloc_block_bdev_batch(struct zram *zram, int req_count, int *act_
 	}
 
 	return blk_idx;
-}
-
-/* 保持原有单块分配函数的兼容性 */
-unsigned long alloc_block_bdev(struct zram *zram)
-{
-	int count = 0;
-	return alloc_block_bdev_batch(zram, 1, &count);
 }
 
 /* 批量释放辅助函数，使用 spinlock 保护 */
@@ -118,6 +157,8 @@ static void complete_wb_batch(struct zram_wb_batch_request *req)
 	bool io_error = bio->bi_status != BLK_STS_OK;
 	int i;
 	int success_count = 0;
+	u64 used_wb_units = 0;
+	u64 refund_wb_units = 0;
 
 	/* 遍历批次中的每一个子请求 */
 	for (i = 0; i < req->count; i++) {
@@ -157,15 +198,15 @@ handle_err:
 	if (success_count > 0) {
 		percpu_counter_add(&zram->stats.bd_writes, success_count);
 		percpu_counter_add(&zram->stats.pages_stored, success_count);
-		
+	}
+
+	used_wb_units = (u64)success_count * (1ULL << (PAGE_SHIFT - 12));
+	if (req->reserved_wb_units > used_wb_units)
+		refund_wb_units = req->reserved_wb_units - used_wb_units;
+
+	if (refund_wb_units) {
 		spin_lock(&zram->wb_limit_lock);
-		if (zram->wb_limit_enable && zram->bd_wb_limit > 0) {
-			u64 decrement = (u64)success_count * (1UL << (PAGE_SHIFT - 12));
-			if (zram->bd_wb_limit >= decrement)
-				zram->bd_wb_limit -= decrement;
-			else
-				zram->bd_wb_limit = 0;
-		}
+		zram->bd_wb_limit += refund_wb_units;
 		spin_unlock(&zram->wb_limit_lock);
 	}
 
@@ -308,6 +349,7 @@ struct zram_wb_batch_request *alloc_wb_batch_request(struct zram *zram,
 	req->ppctl = ctl;
 	req->bio = bio;
 	req->count = 0; /* 初始计数为 0 */
+	req->reserved_wb_units = 0;
 
 	/* 设置 bio 的起始扇区和回调 */
 	bio->bi_iter.bi_sector = start_blk_idx * (PAGE_SIZE >> 9);
