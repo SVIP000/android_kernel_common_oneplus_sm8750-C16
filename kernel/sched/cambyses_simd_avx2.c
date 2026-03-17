@@ -2,8 +2,11 @@
 /*
  * cambyses_simd_avx2.c — AVX2 argmax for Cambyses
  *
- * Finds the index of the maximum s16 score using VPMAXSW
- * reduction + VPCMPEQW broadcast-compare + VPMOVMSKB + BSF.
+ * Finds the index of the maximum s16 score using PHMINPOSUW
+ * (SSE4.1 horizontal min+position, always available under -mavx2).
+ *
+ * Scores are XOR'd with 0x7FFF to convert s16-max → u16-min, then
+ * PHMINPOSUW returns both the minimum value and its lane index.
  *
  * Must be called within cambyses_simd_begin/end.
  * Compiled with: CFLAGS += -mavx -mavx2
@@ -17,66 +20,87 @@
 #ifdef CONFIG_SCHED_CAMBYSES_SIMD
 
 /*
+ * XOR mask: s16 max → u16 min conversion for PHMINPOSUW.
+ *   score 2295  (0x08F7) → 0x7708 (low u16 → selected)
+ *   score -765  (0xFD03) → 0x82FC
+ *   S16_MIN     (0x8000) → 0xFFFF (max u16 → never selected)
+ */
+static const v8hi phminpos_xor = {
+	0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF,
+	0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF
+};
+
+/*
+ * argmax of a single XMM (8 × s16) via PHMINPOSUW.
+ * Returns lane index (0–7) of the maximum s16 value.
+ * On tie, returns the lowest index (PHMINPOSUW guarantee).
+ */
+static __always_inline int argmax_xmm(v8hi s)
+{
+	v8hi r = (v8hi)__builtin_ia32_phminposuw128(s ^ phminpos_xor);
+
+	return (unsigned short)r[1];
+}
+
+/*
  * SIMD argmax: find index of highest s16 score using AVX2.
  *
- * Algorithm:
- *   1. Load 32 scores into 2 ymm registers (s0, s1)
- *   2. VPMAXSW to reduce 32 → 16 lane-wise maxima
- *   3. Scalar horizontal max across 16 values (15 comparisons)
- *   4. Broadcast max value to ymm, VPCMPEQW against s0/s1
- *   5. VPMOVMSKB + BSF to find first matching position
+ * PHMINPOSUW is a 128-bit instruction, so we load XMMs directly
+ * and run PHMINPOSUW on each, then compare the results.
  *
- * @scores: array of SCHED_NR_MIGRATE_BREAK s16 scores (no alignment required).
+ * Register usage adapts to CAMBYSES_SIMD_SCORES_SIZE at compile time:
+ *   32: 4 xmm loads → 4 PHMINPOSUW → 3 scalar comparisons
+ *   16: 2 xmm loads → 2 PHMINPOSUW → 1 scalar comparison
+ *    8: 1 xmm load  → 1 PHMINPOSUW (direct result)
+ *
+ * @scores: array of CAMBYSES_SIMD_SCORES_SIZE s16 values.
  *          Unused entries must be S16_MIN.
- *
- * Cost: ~16 SIMD ops + ~15 scalar comparisons ≈ 8–12 cycles on OOO.
- * vs scalar argmax: ~62 ops ≈ 20 cycles.  ~60% faster per extraction.
  */
 int cambyses_simd_argmax_avx2(const s16 *scores)
 {
-	v16hi s0, s1, m, bcast, c0, c1;
-	int j, mask0, mask1;
-	s16 max_val;
+#if CAMBYSES_SIMD_SCORES_SIZE >= 32
+	v8hi r0, r1, r2, r3;
+	u16 v0, v1, v2, v3;
 
-	/* Load all 32 scores: 64 bytes = 2 ymm (unaligned via v16hi_u) */
-	s0 = *(const v16hi_u *)&scores[0];
-	s1 = *(const v16hi_u *)&scores[16];
+	r0 = (v8hi)__builtin_ia32_phminposuw128(
+		*(const v8hi_u *)&scores[0]  ^ phminpos_xor);
+	r1 = (v8hi)__builtin_ia32_phminposuw128(
+		*(const v8hi_u *)&scores[8]  ^ phminpos_xor);
+	r2 = (v8hi)__builtin_ia32_phminposuw128(
+		*(const v8hi_u *)&scores[16] ^ phminpos_xor);
+	r3 = (v8hi)__builtin_ia32_phminposuw128(
+		*(const v8hi_u *)&scores[24] ^ phminpos_xor);
 
-	/* VPMAXSW: lane-wise max, 32 → 16 values */
-	m = __builtin_ia32_pmaxsw256(s0, s1);
+	v0 = (u16)r0[0]; v1 = (u16)r1[0];
+	v2 = (u16)r2[0]; v3 = (u16)r3[0];
 
-	/*
-	 * Horizontal max across 16 lanes.  Staying in SIMD for this
-	 * would need VPERM2I128 + VPSHUFD + VPSHUFLW (6 shuffle+max
-	 * pairs) then a GPR extract — roughly the same cost as 15
-	 * scalar comparisons from vector lane extraction.  GCC
-	 * compiles m[j] to VPEXTRW which is 1 µop on Intel/AMD.
-	 */
-	max_val = m[0];
-	for (j = 1; j < 16; j++)
-		if (m[j] > max_val)
-			max_val = m[j];
+	/* Lowest inverted value = highest original score; prefer lower index */
+	if (v0 <= v1 && v0 <= v2 && v0 <= v3)
+		return (u16)r0[1];
+	if (v1 <= v2 && v1 <= v3)
+		return 8 + (u16)r1[1];
+	if (v2 <= v3)
+		return 16 + (u16)r2[1];
+	return 24 + (u16)r3[1];
 
-	/* Broadcast max value to all 16 lanes */
-	bcast = (v16hi){max_val, max_val, max_val, max_val,
-			max_val, max_val, max_val, max_val,
-			max_val, max_val, max_val, max_val,
-			max_val, max_val, max_val, max_val};
+#elif CAMBYSES_SIMD_SCORES_SIZE >= 16
+	v8hi r0, r1;
+	u16 v0, v1;
 
-	/*
-	 * VPCMPEQW: each lane → 0xFFFF if equal to max, 0 otherwise.
-	 * VPMOVMSKB: extract MSB of each byte → 32-bit mask.
-	 * Each s16 match produces 2 consecutive set bits in the mask.
-	 * BSF finds the first set bit; dividing by 2 gives the s16 index.
-	 */
-	c0 = (s0 == bcast);
-	c1 = (s1 == bcast);
-	mask0 = __builtin_ia32_pmovmskb256((v32qi)c0);
-	mask1 = __builtin_ia32_pmovmskb256((v32qi)c1);
+	r0 = (v8hi)__builtin_ia32_phminposuw128(
+		*(const v8hi_u *)&scores[0] ^ phminpos_xor);
+	r1 = (v8hi)__builtin_ia32_phminposuw128(
+		*(const v8hi_u *)&scores[8] ^ phminpos_xor);
 
-	if (mask0)
-		return __builtin_ctz(mask0) >> 1;
-	return 16 + (__builtin_ctz(mask1) >> 1);
+	v0 = (u16)r0[0]; v1 = (u16)r1[0];
+
+	if (v0 <= v1)
+		return (u16)r0[1];
+	return 8 + (u16)r1[1];
+
+#else /* CAMBYSES_SIMD_SCORES_SIZE == 8 */
+	return argmax_xmm(*(const v8hi_u *)&scores[0]);
+#endif
 }
 
 #endif /* CONFIG_SCHED_CAMBYSES_SIMD */

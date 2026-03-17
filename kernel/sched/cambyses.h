@@ -46,42 +46,77 @@ void cambyses_update_f3(struct task_struct *p);
  * SIMD argmax — separate TUs to prevent auto-vectorization contamination.
  * Each file is compiled with its own ISA flags.
  *
- * Finds the index of the maximum s16 score across all
- * SCHED_NR_MIGRATE_BREAK entries.  Unused entries must be S16_MIN.
+ * Finds the index of the maximum s16 score across
+ * CAMBYSES_SIMD_SCORES_SIZE entries.  Unused entries must be S16_MIN.
  * No alignment requirement — loads are unaligned-safe.
+ *
+ * CAMBYSES_SIMD_SCORES_SIZE rounds SCHED_NR_MIGRATE_BREAK up to the
+ * nearest SIMD-friendly boundary (8, 16, or 32) so that every load
+ * stays within the array.  Extra slots are padded with S16_MIN.
+ *
+ * x86 uses PHMINPOSUW (SSE4.1) for O(1) horizontal argmax per XMM:
+ *   XOR 0x7FFF converts s16-max to u16-min, PHMINPOSUW returns both
+ *   the minimum value and its lane index in one instruction.
+ *   AVX2 always has SSE4.1; SSSE3 path uses it when detected at boot.
+ *
+ * Register usage (compile-time, zero runtime overhead):
+ *   scores_size 32: 4 xmm loads → 4 PHMINPOSUW + 3 comparisons
+ *   scores_size 16: 2 xmm loads → 2 PHMINPOSUW + 1 comparison
+ *   scores_size  8: 1 xmm load  → 1 PHMINPOSUW (direct result)
  */
 #ifdef CONFIG_SCHED_CAMBYSES_SIMD
 
-#define CAMBYSES_SIMD_THRESHOLD		8
+/*
+ * Scores array size for SIMD argmax — rounded up from
+ * SCHED_NR_MIGRATE_BREAK to the next SIMD-friendly boundary.
+ * This ensures every XMM/YMM/Q load stays within bounds.
+ *
+ * SCHED_NR_MIGRATE_BREAK is defined in sched.h which cannot be
+ * included from SIMD TUs (they are compiled with ISA-specific flags
+ * and sched.h would pull in code subject to auto-vectorization).
+ *
+ * Mirror the definition here with a guard so it's a no-op when
+ * sched.h has already been included (via fair.c → cambyses.c).
+ */
+#ifndef SCHED_NR_MIGRATE_BREAK
+#ifdef CONFIG_PREEMPT_RT
+# define SCHED_NR_MIGRATE_BREAK 8
+#else
+# define SCHED_NR_MIGRATE_BREAK 32
+#endif
+#endif
+#if SCHED_NR_MIGRATE_BREAK <= 8
+#define CAMBYSES_SIMD_SCORES_SIZE	8
+#elif SCHED_NR_MIGRATE_BREAK <= 16
+#define CAMBYSES_SIMD_SCORES_SIZE	16
+#elif SCHED_NR_MIGRATE_BREAK <= 32
+#define CAMBYSES_SIMD_SCORES_SIZE	32
+#else
+#error "SCHED_NR_MIGRATE_BREAK > 32 not supported by Cambyses SIMD argmax"
+#endif
+
+/*
+ * Minimum candidates to enter SIMD path.
+ * Must be <= SCHED_NR_MIGRATE_BREAK.
+ */
+#define CAMBYSES_SIMD_THRESHOLD		min_t(int, 8, SCHED_NR_MIGRATE_BREAK)
 
 /* Static keys for ISA dispatch — enabled at boot based on CPUID/HWCAP */
 #ifdef CONFIG_X86_64
 extern struct static_key_false cambyses_has_avx2;
 extern struct static_key_false cambyses_has_ssse3;
+extern struct static_key_false cambyses_has_sse41;
 #endif
 #ifdef CONFIG_ARM64
 extern struct static_key_false cambyses_has_neon;
 #endif
 
 #ifdef CONFIG_X86_64
-/*
- * AVX2 argmax: loads 32 × s16 into 2 ymm, VPMAXSW reduction,
- * VPCMPEQW + VPMOVMSKB + BSF for position.  ~16 ops per extraction.
- */
 int cambyses_simd_argmax_avx2(const s16 *scores);
-
-/*
- * SSSE3 argmax: loads 32 × s16 into 4 xmm, PMAXSW reduction,
- * PCMPEQW + PMOVMSKB + BSF for position.  ~24 ops per extraction.
- */
 int cambyses_simd_argmax_ssse3(const s16 *scores);
 #endif
 
 #ifdef CONFIG_ARM64
-/*
- * NEON argmax: loads 32 × s16 into 4 Q registers, SMAXP reduction,
- * SMAXV + CMEQ + bitmask extraction.  ~20 ops per extraction.
- */
 int cambyses_simd_argmax_neon(const s16 *scores);
 #endif
 

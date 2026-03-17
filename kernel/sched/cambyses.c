@@ -20,14 +20,14 @@
 #define CAMBYSES_PROGNAME "Cambyses Migration Selector"
 #define CAMBYSES_AUTHOR   "Masahito Suzuki"
 
-#define CAMBYSES_VERSION  "0.2.0"
+#define CAMBYSES_VERSION  "0.2.1"
 
 /* Runtime toggle — NOP-patched when disabled */
 DEFINE_STATIC_KEY_TRUE(sched_cambyses);
 
-/* Default weights: w1=2 (load contribution dominant), w0=w2=w3=1 */
+/* Default weights: w1=3 (load contribution dominant), w0=w2=w3=1 */
 u8 sysctl_cambyses_w0 = 1;
-u8 sysctl_cambyses_w1 = 2;
+u8 sysctl_cambyses_w1 = 3;
 u8 sysctl_cambyses_w2 = 1;
 u8 sysctl_cambyses_w3 = 1;
 
@@ -35,6 +35,7 @@ u8 sysctl_cambyses_w3 = 1;
 #ifdef CONFIG_X86_64
 DEFINE_STATIC_KEY_FALSE(cambyses_has_avx2);
 DEFINE_STATIC_KEY_FALSE(cambyses_has_ssse3);
+DEFINE_STATIC_KEY_FALSE(cambyses_has_sse41);
 #endif
 #ifdef CONFIG_ARM64
 DEFINE_STATIC_KEY_FALSE(cambyses_has_neon);
@@ -322,7 +323,13 @@ static int detach_tasks_cambyses(struct lb_env *env)
 {
 	struct list_head *tasks = &env->src_rq->cfs_tasks;
 	struct cambyses_candidate cands[SCHED_NR_MIGRATE_BREAK];
+#ifdef CONFIG_SCHED_CAMBYSES_SIMD
+	s16 scores[CAMBYSES_SIMD_SCORES_SIZE] = {
+		[0 ... CAMBYSES_SIMD_SCORES_SIZE - 1] = S16_MIN
+	};
+#else
 	s16 scores[SCHED_NR_MIGRATE_BREAK];
+#endif
 	LIST_HEAD(cand_tasks);
 	int nr_cands = 0;
 	int detached = 0;
@@ -420,10 +427,6 @@ skip:
 		int selected[SCHED_NR_MIGRATE_BREAK];
 		int nr_selected = 0;
 		int j;
-
-		/* Pad unused entries so SIMD loads see S16_MIN */
-		for (j = nr_cands; j < SCHED_NR_MIGRATE_BREAK; j++)
-			scores[j] = S16_MIN;
 
 		/*
 		 * Phase 2a: SIMD selection — pick winners inside FPU context.
@@ -566,7 +569,12 @@ static int __init cambyses_init(void)
 		simd_name = "AVX2";
 	} else if (boot_cpu_has(X86_FEATURE_SSSE3)) {
 		static_branch_enable(&cambyses_has_ssse3);
-		simd_name = "SSSE3";
+		if (boot_cpu_has(X86_FEATURE_XMM4_1)) {
+			static_branch_enable(&cambyses_has_sse41);
+			simd_name = "SSE4.1";
+		} else {
+			simd_name = "SSSE3";
+		}
 	} else {
 		simd_name = "none";
 	}
