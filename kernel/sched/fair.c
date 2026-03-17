@@ -57,6 +57,10 @@
 #include "stats.h"
 #include "autogroup.h"
 
+#ifdef CONFIG_SCHED_CAMBYSES
+#include "cambyses.h"
+#endif
+
 #include <trace/hooks/sched.h>
 
 EXPORT_TRACEPOINT_SYMBOL_GPL(sched_stat_runtime);
@@ -7013,6 +7017,10 @@ static unsigned long capacity_of(int cpu)
 
 static void record_wakee(struct task_struct *p)
 {
+#ifdef CONFIG_SCHED_CAMBYSES
+	bool flips_changed = false;
+#endif
+
 	/*
 	 * Only decay a single time; tasks that have less then 1 wakeup per
 	 * jiffy will not have built up many flips.
@@ -7020,12 +7028,23 @@ static void record_wakee(struct task_struct *p)
 	if (time_after(jiffies, current->wakee_flip_decay_ts + HZ)) {
 		current->wakee_flips >>= 1;
 		current->wakee_flip_decay_ts = jiffies;
+#ifdef CONFIG_SCHED_CAMBYSES
+		flips_changed = true;
+#endif
 	}
 
 	if (current->last_wakee != p) {
 		current->last_wakee = p;
 		current->wakee_flips++;
+#ifdef CONFIG_SCHED_CAMBYSES
+		flips_changed = true;
+#endif
 	}
+
+#ifdef CONFIG_SCHED_CAMBYSES
+	if (flips_changed)
+		cambyses_update_f3(current);
+#endif
 }
 
 /*
@@ -9174,11 +9193,20 @@ static void detach_task(struct task_struct *p, struct lb_env *env)
  *
  * Returns a task if successful and NULL otherwise.
  */
+#ifdef CONFIG_SCHED_CAMBYSES
+#include "cambyses.c"
+#endif
+
 static struct task_struct *detach_one_task(struct lb_env *env)
 {
 	struct task_struct *p;
 
 	lockdep_assert_rq_held(env->src_rq);
+
+#ifdef CONFIG_SCHED_CAMBYSES
+	if (static_branch_likely(&sched_cambyses))
+		return detach_one_task_cambyses(env);
+#endif
 
 	list_for_each_entry_reverse(p,
 			&env->src_rq->cfs_tasks, se.group_node) {
@@ -9225,6 +9253,11 @@ static int detach_tasks(struct lb_env *env)
 
 	if (env->imbalance <= 0)
 		return 0;
+
+#ifdef CONFIG_SCHED_CAMBYSES
+	if (static_branch_likely(&sched_cambyses))
+		return detach_tasks_cambyses(env);
+#endif
 
 	while (!list_empty(tasks)) {
 		/*

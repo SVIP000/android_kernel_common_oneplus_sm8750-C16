@@ -89,7 +89,7 @@
 
 #include "sched.h"
 #include "stats.h"
-#include "autogroup.h"
+#include "cambyses.h"
 
 #include "autogroup.h"
 #include "pelt.h"
@@ -7017,6 +7017,10 @@ static void __sched notrace __schedule(unsigned int sched_mode)
 		 *   is a RELEASE barrier),
 		 */
 		++*switch_count;
+#ifdef CONFIG_SCHED_CAMBYSES
+		/* Update cached vol_switch_ratio for Score Shadow */
+		cambyses_update_f2(prev);
+#endif
 
 		migrate_disable_switch(rq, prev);
 		psi_account_irqtime(rq, prev, next);

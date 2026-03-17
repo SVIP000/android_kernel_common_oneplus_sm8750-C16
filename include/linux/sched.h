@@ -543,6 +543,25 @@ struct sched_entity {
 	struct list_head		group_node;
 	unsigned int			on_rq;
 
+#ifdef CONFIG_SCHED_CAMBYSES
+#ifndef __GENKSYMS__
+	/*
+	 * Cached Cambyses feature values — co-located with group_node
+	 * and exec_start on the same cache line for zero-cost read
+	 * during Phase 1 scoring.  Eliminates 2 DRAM misses per task
+	 * on CPUs with limited memory-level parallelism.
+	 *
+	 * cambyses_f2: vol_switch_ratio (updated at context switch)
+	 * cambyses_f3: wakee_penalty    (updated at record_wakee)
+	 */
+	u8				cambyses_f2;
+	u8				cambyses_f3;
+	u8				__cambyses_pad[2];
+#endif
+#else
+ 					/* hole */
+#endif
+
 	u64				exec_start;
 	u64				sum_exec_runtime;
 	u64				prev_sum_exec_runtime;
