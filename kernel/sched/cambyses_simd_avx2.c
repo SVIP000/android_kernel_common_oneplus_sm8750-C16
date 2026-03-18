@@ -21,8 +21,8 @@
 
 /*
  * XOR mask: s16 max → u16 min conversion for PHMINPOSUW.
- *   score 2295  (0x08F7) → 0x7708 (low u16 → selected)
- *   score -765  (0xFD03) → 0x82FC
+ *   score 1746  (0x06D2) → 0x792D (low u16 → selected)
+ *   score -777  (0xFCF7) → 0x8308
  *   S16_MIN     (0x8000) → 0xFFFF (max u16 → never selected)
  */
 static const v8hi phminpos_xor = {
@@ -42,23 +42,33 @@ static __always_inline int argmax_xmm(v8hi s)
 	return (unsigned short)r[1];
 }
 
-/*
- * SIMD argmax: find index of highest s16 score using AVX2.
- *
- * PHMINPOSUW is a 128-bit instruction, so we load XMMs directly
- * and run PHMINPOSUW on each, then compare the results.
- *
- * Register usage adapts to CAMBYSES_SIMD_SCORES_SIZE at compile time:
- *   32: 4 xmm loads → 4 PHMINPOSUW → 3 scalar comparisons
- *   16: 2 xmm loads → 2 PHMINPOSUW → 1 scalar comparison
- *    8: 1 xmm load  → 1 PHMINPOSUW (direct result)
- *
- * @scores: array of CAMBYSES_SIMD_SCORES_SIZE s16 values.
- *          Unused entries must be S16_MIN.
- */
-int cambyses_simd_argmax_avx2(const s16 *scores)
+/* 8 entries — 1 PHMINPOSUW (direct result) */
+int cambyses_simd_argmax_avx2_8(const s16 *scores)
 {
-#if CAMBYSES_SIMD_SCORES_SIZE >= 32
+	return argmax_xmm(*(const v8hi_u *)&scores[0]);
+}
+
+/* 16 entries — 2 PHMINPOSUW + 1 scalar comparison */
+int cambyses_simd_argmax_avx2_16(const s16 *scores)
+{
+	v8hi r0, r1;
+	u16 v0, v1;
+
+	r0 = (v8hi)__builtin_ia32_phminposuw128(
+		*(const v8hi_u *)&scores[0] ^ phminpos_xor);
+	r1 = (v8hi)__builtin_ia32_phminposuw128(
+		*(const v8hi_u *)&scores[8] ^ phminpos_xor);
+
+	v0 = (u16)r0[0]; v1 = (u16)r1[0];
+
+	if (v0 <= v1)
+		return (u16)r0[1];
+	return 8 + (u16)r1[1];
+}
+
+/* 32 entries — 4 PHMINPOSUW + 3 scalar comparisons */
+int cambyses_simd_argmax_avx2_32(const s16 *scores)
+{
 	v8hi r0, r1, r2, r3;
 	u16 v0, v1, v2, v3;
 
@@ -82,25 +92,6 @@ int cambyses_simd_argmax_avx2(const s16 *scores)
 	if (v2 <= v3)
 		return 16 + (u16)r2[1];
 	return 24 + (u16)r3[1];
-
-#elif CAMBYSES_SIMD_SCORES_SIZE >= 16
-	v8hi r0, r1;
-	u16 v0, v1;
-
-	r0 = (v8hi)__builtin_ia32_phminposuw128(
-		*(const v8hi_u *)&scores[0] ^ phminpos_xor);
-	r1 = (v8hi)__builtin_ia32_phminposuw128(
-		*(const v8hi_u *)&scores[8] ^ phminpos_xor);
-
-	v0 = (u16)r0[0]; v1 = (u16)r1[0];
-
-	if (v0 <= v1)
-		return (u16)r0[1];
-	return 8 + (u16)r1[1];
-
-#else /* CAMBYSES_SIMD_SCORES_SIZE == 8 */
-	return argmax_xmm(*(const v8hi_u *)&scores[0]);
-#endif
 }
 
 #endif /* CONFIG_SCHED_CAMBYSES_SIMD */

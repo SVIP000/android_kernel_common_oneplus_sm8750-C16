@@ -20,7 +20,7 @@
 #define CAMBYSES_PROGNAME "Cambyses Migration Selector"
 #define CAMBYSES_AUTHOR   "Masahito Suzuki"
 
-#define CAMBYSES_VERSION  "0.2.1"
+#define CAMBYSES_VERSION  "0.2.3"
 
 /* Runtime toggle — NOP-patched when disabled */
 DEFINE_STATIC_KEY_TRUE(sched_cambyses);
@@ -150,7 +150,7 @@ static inline void prefetch_migration_task(struct task_struct *p)
  *   F2: vol switch ratio     — nvcsw/(nvcsw+nivcsw) × 64 (higher = I/O-bound = cheaper)
  *   F3: wakee penalty        — log2p1(wakee_flips + 1) (higher = riskier)
  *
- * Score range: max ~2295, min ~-765 → fits in s16.
+ * Score range: max ~1746, min ~-777 → fits in s16.
  */
 static s16 score_task_cambyses(struct task_struct *p, struct lb_env *env)
 {
@@ -236,9 +236,10 @@ static void consume_imbalance_cambyses(struct task_struct *p,
  *      FPU register cache invalidation).
  *
  * ARM64: kernel_neon_begin() BUG_ON's with irqs_disabled(), so we
- *        bypass it by driving the FPSIMD save directly.  If
- *        TIF_FOREIGN_FPSTATE is already set (common case after context
- *        switch), the state is already saved — cost ≈ 0.
+ *        use fpsimd_save_and_flush_cpu_state() which saves the user
+ *        FPSIMD/SVE/SME state and invalidates the CPU's register
+ *        cache.  If TIF_FOREIGN_FPSTATE is already set (common case
+ *        after context switch), the state is already saved — cost ≈ 0.
  */
 
 #ifdef CONFIG_X86_64
@@ -260,23 +261,7 @@ static __always_inline void cambyses_simd_end(void)
 
 static __always_inline void cambyses_simd_begin(void)
 {
-	if (!(current->flags & PF_KTHREAD) &&
-	    !test_thread_flag(TIF_FOREIGN_FPSTATE)) {
-		/*
-		 * Invalidate the per-CPU FPSIMD register cache.  Without
-		 * this, fpsimd_thread_switch() would see
-		 *   fpsimd_last_state.st == &current->thread.uw.fpsimd_state
-		 *   && fpsimd_cpu == this_cpu
-		 * and CLEAR TIF_FOREIGN_FPSTATE — causing
-		 * fpsimd_restore_current_state() to skip the restore on
-		 * return to userspace, with NEON-clobbered registers.
-		 *
-		 * kernel_neon_begin() does this via fpsimd_flush_cpu_state().
-		 * We write NULL directly to avoid the full flush (which
-		 * also handles SME streaming mode, unnecessary here).
-		 */
-		fpsimd_save_and_flush_cpu_state();
-	}
+	fpsimd_save_and_flush_cpu_state();
 }
 
 static __always_inline void cambyses_simd_end(void)
@@ -420,7 +405,7 @@ skip:
 	 * Scalar fallback: branchless CMP+CMOV loop, ~20 cycles / extraction.
 	 *
 	 * S16_MIN (-32768) is used as a tombstone: real scores range
-	 * from -765 to +2295, so it can never be a valid score.
+	 * from -777 to +1746, so it can never be a valid score.
 	 */
 #ifdef CONFIG_SCHED_CAMBYSES_SIMD
 	if (nr_cands >= CAMBYSES_SIMD_THRESHOLD) {

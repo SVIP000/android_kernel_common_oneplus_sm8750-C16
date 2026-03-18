@@ -63,23 +63,89 @@ static const v8hi phminpos_xor = {
 	0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF
 };
 
-/*
- * SIMD argmax: find index of highest s16 score.
- *
- * Two paths selected at runtime via static branch:
- *
- * SSE4.1 (PHMINPOSUW): XOR + PHMINPOSUW per XMM, then scalar
- *   comparison across groups.  ~3 ops for 8 entries.
- *
- * SSSE3 fallback: PMAXSW reduction → scalar horizontal max →
- *   broadcast PCMPEQW → PMOVMSKB + BSF.  ~12 ops for 8 entries.
- *
- * @scores: array of CAMBYSES_SIMD_SCORES_SIZE s16 values.
- *          Unused entries must be S16_MIN.
- */
-int cambyses_simd_argmax_ssse3(const s16 *scores)
+/* ---- 8-entry variant ---- */
+
+int cambyses_simd_argmax_ssse3_8(const s16 *scores)
 {
-#if CAMBYSES_SIMD_SCORES_SIZE >= 32
+	v8hi s0;
+
+	s0 = *(const v8hi_u *)&scores[0];
+
+	if (static_branch_likely(&cambyses_has_sse41)) {
+		v8hi r = __phminposuw128(s0 ^ phminpos_xor);
+
+		return (u16)r[1];
+	} else {
+		v8hi bcast, c0;
+		int j, mask0;
+		s16 max_val;
+
+		max_val = s0[0];
+		for (j = 1; j < 8; j++)
+			if (s0[j] > max_val)
+				max_val = s0[j];
+
+		bcast = (v8hi){max_val, max_val, max_val, max_val,
+			       max_val, max_val, max_val, max_val};
+
+		c0 = (s0 == bcast);
+		mask0 = __pmovmskb128((v16qi)c0);
+
+		return __builtin_ctz(mask0) >> 1;
+	}
+}
+
+/* ---- 16-entry variant ---- */
+
+int cambyses_simd_argmax_ssse3_16(const s16 *scores)
+{
+	v8hi s0, s1;
+
+	s0 = *(const v8hi_u *)&scores[0];
+	s1 = *(const v8hi_u *)&scores[8];
+
+	if (static_branch_likely(&cambyses_has_sse41)) {
+		v8hi r0, r1;
+		u16 v0, v1;
+
+		r0 = __phminposuw128(s0 ^ phminpos_xor);
+		r1 = __phminposuw128(s1 ^ phminpos_xor);
+
+		v0 = (u16)r0[0]; v1 = (u16)r1[0];
+
+		if (v0 <= v1)
+			return (u16)r0[1];
+		return 8 + (u16)r1[1];
+	} else {
+		v8hi m, bcast, c0, c1;
+		int j, mask0, mask1;
+		s16 max_val;
+
+		m = __pmaxsw128(s0, s1);
+
+		max_val = m[0];
+		for (j = 1; j < 8; j++)
+			if (m[j] > max_val)
+				max_val = m[j];
+
+		bcast = (v8hi){max_val, max_val, max_val, max_val,
+			       max_val, max_val, max_val, max_val};
+
+		c0 = (s0 == bcast);
+		c1 = (s1 == bcast);
+		mask0 = __pmovmskb128((v16qi)c0);
+		mask1 = __pmovmskb128((v16qi)c1);
+
+		if (mask0)
+			return __builtin_ctz(mask0) >> 1;
+		return 8 + (__builtin_ctz(mask1) >> 1);
+	}
+}
+
+/* ---- 32-entry variant ---- */
+
+int cambyses_simd_argmax_ssse3_32(const s16 *scores)
+{
 	v8hi s0, s1, s2, s3;
 
 	s0 = *(const v8hi_u *)&scores[0];
@@ -140,78 +206,6 @@ int cambyses_simd_argmax_ssse3(const s16 *scores)
 			return 16 + (__builtin_ctz(mask2) >> 1);
 		return 24 + (__builtin_ctz(mask3) >> 1);
 	}
-
-#elif CAMBYSES_SIMD_SCORES_SIZE >= 16
-	v8hi s0, s1;
-
-	s0 = *(const v8hi_u *)&scores[0];
-	s1 = *(const v8hi_u *)&scores[8];
-
-	if (static_branch_likely(&cambyses_has_sse41)) {
-		v8hi r0, r1;
-		u16 v0, v1;
-
-		r0 = __phminposuw128(s0 ^ phminpos_xor);
-		r1 = __phminposuw128(s1 ^ phminpos_xor);
-
-		v0 = (u16)r0[0]; v1 = (u16)r1[0];
-
-		if (v0 <= v1)
-			return (u16)r0[1];
-		return 8 + (u16)r1[1];
-	} else {
-		v8hi m, bcast, c0, c1;
-		int j, mask0, mask1;
-		s16 max_val;
-
-		m = __pmaxsw128(s0, s1);
-
-		max_val = m[0];
-		for (j = 1; j < 8; j++)
-			if (m[j] > max_val)
-				max_val = m[j];
-
-		bcast = (v8hi){max_val, max_val, max_val, max_val,
-			       max_val, max_val, max_val, max_val};
-
-		c0 = (s0 == bcast);
-		c1 = (s1 == bcast);
-		mask0 = __pmovmskb128((v16qi)c0);
-		mask1 = __pmovmskb128((v16qi)c1);
-
-		if (mask0)
-			return __builtin_ctz(mask0) >> 1;
-		return 8 + (__builtin_ctz(mask1) >> 1);
-	}
-
-#else /* CAMBYSES_SIMD_SCORES_SIZE == 8 */
-	v8hi s0;
-
-	s0 = *(const v8hi_u *)&scores[0];
-
-	if (static_branch_likely(&cambyses_has_sse41)) {
-		v8hi r = __phminposuw128(s0 ^ phminpos_xor);
-
-		return (u16)r[1];
-	} else {
-		v8hi bcast, c0;
-		int j, mask0;
-		s16 max_val;
-
-		max_val = s0[0];
-		for (j = 1; j < 8; j++)
-			if (s0[j] > max_val)
-				max_val = s0[j];
-
-		bcast = (v8hi){max_val, max_val, max_val, max_val,
-			       max_val, max_val, max_val, max_val};
-
-		c0 = (s0 == bcast);
-		mask0 = __pmovmskb128((v16qi)c0);
-
-		return __builtin_ctz(mask0) >> 1;
-	}
-#endif
 }
 
 #endif /* CONFIG_SCHED_CAMBYSES_SIMD */

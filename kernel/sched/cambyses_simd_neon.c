@@ -19,22 +19,60 @@
 
 #include <asm/neon-intrinsics.h>
 
-/*
- * SIMD argmax: find index of highest s16 score using NEON.
- *
- * Register usage adapts to CAMBYSES_SIMD_SCORES_SIZE at compile time:
- *   32: 4 Q register loads, 3-stage vmaxq reduction
- *   16: 2 Q register loads, 1-stage reduction
- *    8: 1 Q register load, direct SMAXV
- *
- * @scores: array of CAMBYSES_SIMD_SCORES_SIZE s16 values.
- *          Unused entries must be S16_MIN (0x8000).
- */
-int cambyses_simd_argmax_neon(const s16 *scores)
-{
-	static const uint16x8_t pos_weights = {1, 2, 4, 8, 16, 32, 64, 128};
+static const uint16x8_t pos_weights = {1, 2, 4, 8, 16, 32, 64, 128};
 
-#if CAMBYSES_SIMD_SCORES_SIZE >= 32
+/* 8 entries — 1 Q register load, direct SMAXV */
+int cambyses_simd_argmax_neon_8(const s16 *scores)
+{
+	int16x8_t s0;
+	int16_t max_val;
+	int16x8_t bcast;
+	uint16x8_t c0;
+	uint16_t bits0;
+
+	s0 = vld1q_s16(&scores[0]);
+
+	max_val = vmaxvq_s16(s0);
+	bcast = vdupq_n_s16(max_val);
+
+	c0 = vceqq_s16(s0, bcast);
+	bits0 = vaddvq_u16(vandq_u16(c0, pos_weights));
+
+	return __builtin_ctz(bits0);
+}
+
+/* 16 entries — 2 Q register loads, 1-stage reduction */
+int cambyses_simd_argmax_neon_16(const s16 *scores)
+{
+	int16x8_t s0, s1, m;
+	int16_t max_val;
+	int16x8_t bcast;
+	uint16x8_t c0, c1;
+	uint16_t bits0, bits1;
+	uint32_t combined;
+
+	s0 = vld1q_s16(&scores[0]);
+	s1 = vld1q_s16(&scores[8]);
+
+	m = vmaxq_s16(s0, s1);
+
+	max_val = vmaxvq_s16(m);
+	bcast = vdupq_n_s16(max_val);
+
+	c0 = vceqq_s16(s0, bcast);
+	c1 = vceqq_s16(s1, bcast);
+
+	bits0 = vaddvq_u16(vandq_u16(c0, pos_weights));
+	bits1 = vaddvq_u16(vandq_u16(c1, pos_weights));
+
+	combined = (uint32_t)bits0 | ((uint32_t)bits1 << 8);
+
+	return __builtin_ctz(combined);
+}
+
+/* 32 entries — 4 Q register loads, 3-stage vmaxq reduction */
+int cambyses_simd_argmax_neon_32(const s16 *scores)
+{
 	int16x8_t s0, s1, s2, s3;
 	int16x8_t m01, m23, m;
 	int16_t max_val;
@@ -69,50 +107,6 @@ int cambyses_simd_argmax_neon(const s16 *scores)
 		 | ((uint32_t)bits2 << 16) | ((uint32_t)bits3 << 24);
 
 	return __builtin_ctz(combined);
-
-#elif CAMBYSES_SIMD_SCORES_SIZE >= 16
-	int16x8_t s0, s1, m;
-	int16_t max_val;
-	int16x8_t bcast;
-	uint16x8_t c0, c1;
-	uint16_t bits0, bits1;
-	uint32_t combined;
-
-	s0 = vld1q_s16(&scores[0]);
-	s1 = vld1q_s16(&scores[8]);
-
-	m = vmaxq_s16(s0, s1);
-
-	max_val = vmaxvq_s16(m);
-	bcast = vdupq_n_s16(max_val);
-
-	c0 = vceqq_s16(s0, bcast);
-	c1 = vceqq_s16(s1, bcast);
-
-	bits0 = vaddvq_u16(vandq_u16(c0, pos_weights));
-	bits1 = vaddvq_u16(vandq_u16(c1, pos_weights));
-
-	combined = (uint32_t)bits0 | ((uint32_t)bits1 << 8);
-
-	return __builtin_ctz(combined);
-
-#else /* CAMBYSES_SIMD_SCORES_SIZE == 8 */
-	int16x8_t s0;
-	int16_t max_val;
-	int16x8_t bcast;
-	uint16x8_t c0;
-	uint16_t bits0;
-
-	s0 = vld1q_s16(&scores[0]);
-
-	max_val = vmaxvq_s16(s0);
-	bcast = vdupq_n_s16(max_val);
-
-	c0 = vceqq_s16(s0, bcast);
-	bits0 = vaddvq_u16(vandq_u16(c0, pos_weights));
-
-	return __builtin_ctz(bits0);
-#endif
 }
 
 #endif /* CONFIG_SCHED_CAMBYSES_SIMD */

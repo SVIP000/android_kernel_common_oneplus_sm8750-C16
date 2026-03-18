@@ -67,4 +67,5 @@ CFLAGS_cambyses_simd_neon.o += $(CC_FLAGS_FPU) \
 endif # CONFIG_ARM64
 
 endif # CONFIG_SCHED_CAMBYSES_SIMD
+
 obj-$(CONFIG_ANDROID_VENDOR_HOOKS) += vendor_hooks.o
