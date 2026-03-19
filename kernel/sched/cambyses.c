@@ -4,7 +4,7 @@
  *
  * Scored migration selection for CFS load balancer.
  * Replaces FIFO selection with a multi-feature scoring function that evaluates
- * cache coldness, load contribution, voluntary switch ratio, and wakee stability.
+ * cache coldness, CPU lightness, voluntary switch ratio, and wakee stability.
  */
 
 /*
@@ -20,13 +20,13 @@
 #define CAMBYSES_PROGNAME "Cambyses Migration Selector"
 #define CAMBYSES_AUTHOR   "Masahito Suzuki"
 
-#define CAMBYSES_VERSION  "0.2.3"
+#define CAMBYSES_VERSION  "0.2.6"
 
 /* Runtime toggle — NOP-patched when disabled */
 DEFINE_STATIC_KEY_TRUE(sched_cambyses);
 
-/* Default weights: w1=3 (load contribution dominant), w0=w2=w3=1 */
-u8 sysctl_cambyses_w0 = 1;
+/* Default weights: w0=2, w1=3 (CPU lightness dominant), w2=w3=1 */
+u8 sysctl_cambyses_w0 = 2;
 u8 sysctl_cambyses_w1 = 3;
 u8 sysctl_cambyses_w2 = 1;
 u8 sysctl_cambyses_w3 = 1;
@@ -133,8 +133,8 @@ static inline void prefetch_migration_task(struct task_struct *p)
 	/* F0: se.exec_start — same cache line as group_node, but prefetch
 	 * ensures the line is in-flight before we dereference group_node. */
 	prefetch(&p->se.exec_start);
-	/* F1: se.avg.load_avg (used by task_h_load) — separate cache line */
-	prefetch(&p->se.avg.load_avg);
+	/* F1: se.avg.util_avg — separate cache line */
+	prefetch(&p->se.avg.util_avg);
 	/* can_migrate_task: cpus_ptr + migration_disabled — separate cache line */
 	prefetch(&p->cpus_ptr);
 	/* F2/F3: cached in se.cambyses_f2/f3 (same cache line as group_node)
@@ -145,17 +145,28 @@ static inline void prefetch_migration_task(struct task_struct *p)
  * score_task_cambyses — compute migration suitability score for a task
  *
  * Features (u8, range varies per feature):
- *   F0: cache coldness       — log2p1(time since last exec) (higher = colder = better)
- *   F1: load contribution    — log2p1(task hierarchical load) (higher = more effective)
+ *   F0: cache coldness       — log2p1(time since last exec) (higher = colder = cheaper)
+ *   F1: CPU lightness        — log2p1(1025 - util_avg) (higher = lighter = cheaper)
  *   F2: vol switch ratio     — nvcsw/(nvcsw+nivcsw) × 64 (higher = I/O-bound = cheaper)
  *   F3: wakee penalty        — log2p1(wakee_flips + 1) (higher = riskier)
  *
- * Score range: max ~1746, min ~-777 → fits in s16.
+ * F0+F1+F2 all point in the same direction: prefer migrating lightweight,
+ * cache-cold, I/O-bound tasks.  F3 is the sole brake: don't migrate
+ * communication hubs that would cause cross-CPU IPI storms.
+ *
+ * F1 uses inverted PELT util_avg: CPU-bound tasks (util≈1024) → F1≈0,
+ * sleep/wake tasks (util≈50) → F1≈40.  This protects cache-hot CPU-bound
+ * tasks from migration while preferring lightweight tasks that are cheap
+ * to move.  Unlike task_h_load, this is independent of nice weight and
+ * BORE penalty adjustments.
+ *
+ * Score range: max ~292, min ~-65 → fits in s16.
  */
 static s16 score_task_cambyses(struct task_struct *p, struct lb_env *env)
 {
+	unsigned long util = READ_ONCE(p->se.avg.util_avg);
 	int f0 = log2p1_u64_u8fp2(rq_clock_task(env->src_rq) - p->se.exec_start);
-	int f1 = log2p1_u64_u8fp2(max_t(unsigned long, task_h_load(p), 1));
+	int f1 = log2p1_u64_u8fp2(max(1025UL - min(util, 1024UL), 1UL));
 	/* F2/F3: read from Score Shadow cache (same cache line as group_node) */
 	int f2 = p->se.cambyses_f2;
 	int f3 = p->se.cambyses_f3;

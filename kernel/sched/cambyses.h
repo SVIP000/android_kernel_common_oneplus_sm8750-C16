@@ -29,8 +29,8 @@ struct cambyses_candidate {
 extern struct static_key_true sched_cambyses;
 
 /* sysctl tunable weights (0–3, 2bit) */
-extern u8 sysctl_cambyses_w0;	/* cache coldness weight (default: 1) */
-extern u8 sysctl_cambyses_w1;	/* load contribution weight (default: 2) */
+extern u8 sysctl_cambyses_w0;	/* cache coldness weight (default: 2) */
+extern u8 sysctl_cambyses_w1;	/* CPU lightness weight (default: 3) */
 extern u8 sysctl_cambyses_w2;	/* vol switch ratio weight (default: 1) */
 extern u8 sysctl_cambyses_w3;	/* wakee penalty weight (default: 1) */
 
