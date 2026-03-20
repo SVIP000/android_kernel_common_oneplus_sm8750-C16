@@ -18,6 +18,42 @@ static DECLARE_WAIT_QUEUE_HEAD(wb_wq);
 static struct zram_wb_request_list wb_req_list;
 static struct bio_set zram_wb_bs;
 
+static void zram_wb_release_bio_pages(struct zram *zram, struct bio *bio)
+{
+	struct bio_vec *bv;
+	struct bvec_iter_all iter;
+
+	bio_for_each_segment_all(bv, bio, iter)
+		mempool_free(bv->bv_page, zram->wb_page_pool);
+}
+
+void zram_wb_record_run(struct zram_wb_batch_request *req,
+			unsigned long index,
+			unsigned long blk_idx)
+{
+	struct zram_wb_run *run;
+
+	if (!req->run_count) {
+		run = &req->runs[req->run_count++];
+		run->index_start = index;
+		run->blk_start = blk_idx;
+		run->nr_pages = 1;
+		return;
+	}
+
+	run = &req->runs[req->run_count - 1];
+	if (run->index_start + run->nr_pages == index &&
+	    run->blk_start + run->nr_pages == blk_idx) {
+		run->nr_pages++;
+		return;
+	}
+
+	run = &req->runs[req->run_count++];
+	run->index_start = index;
+	run->blk_start = blk_idx;
+	run->nr_pages = 1;
+}
+
 /* 
  * front_pad: 在 bio 结构之前预留空间存放 zram_wb_batch_request
  * 这个结构现在比较大 (包含数组)，必须确保 bio 对齐
@@ -98,12 +134,16 @@ unsigned long alloc_block_bdev_batch(struct zram *zram, int req_count, int *act_
 	}
 
 	if (blk_idx < zram->nr_pages) {
-		/* 向后探测连续空闲块 */
-		count = 1;
-		while (count < req_count && (blk_idx + count) < zram->nr_pages &&
-		       !test_bit(blk_idx + count, zram->bitmap)) {
-			count++;
-		}
+		unsigned long search_end;
+		unsigned long next_used_idx;
+
+		/*
+		 * Fallback path: derive free run length by finding the next used bit
+		 * instead of probing each bit in a loop under bitmap_lock.
+		 */
+		search_end = min(zram->nr_pages, blk_idx + (unsigned long)req_count);
+		next_used_idx = find_next_bit(zram->bitmap, search_end, blk_idx + 1);
+		count = (int)(next_used_idx - blk_idx);
 		
 		bitmap_set(zram->bitmap, blk_idx, count);
 		zram->bitmap_last_free_hint = blk_idx + count;
@@ -159,6 +199,34 @@ static void complete_wb_batch(struct zram_wb_batch_request *req)
 	int success_count = 0;
 	u64 used_wb_units = 0;
 	u64 refund_wb_units = 0;
+	unsigned long rollback_start = 0;
+	int rollback_count = 0;
+
+	if (unlikely(io_error)) {
+		for (i = 0; i < req->count; i++) {
+			struct zram_wb_sub_req *sub = &req->sub_reqs[i];
+			unsigned long blk_idx = sub->blk_idx;
+			struct zram_pp_slot *pps = sub->pps;
+
+			if (!rollback_count) {
+				rollback_start = blk_idx;
+				rollback_count = 1;
+			} else if (blk_idx == rollback_start + rollback_count) {
+				rollback_count++;
+			} else {
+				free_block_bdev_range(zram, rollback_start, rollback_count);
+				rollback_start = blk_idx;
+				rollback_count = 1;
+			}
+
+			free_pp_slot(zram, pps);
+		}
+
+		if (rollback_count)
+			free_block_bdev_range(zram, rollback_start, rollback_count);
+
+		goto finalize_batch;
+	}
 
 	/* 遍历批次中的每一个子请求 */
 	for (i = 0; i < req->count; i++) {
@@ -166,9 +234,6 @@ static void complete_wb_batch(struct zram_wb_batch_request *req)
 		unsigned long index = sub->index;
 		unsigned long blk_idx = sub->blk_idx;
 		struct zram_pp_slot *pps = sub->pps;
-
-		if (io_error)
-			goto handle_err;
 
 		/* 锁定槽位进行状态变更 */
 		zram_slot_lock(zram, index);
@@ -194,6 +259,14 @@ handle_err:
 		free_block_bdev(zram, blk_idx);
 		free_pp_slot(zram, pps);
 	}
+
+	for (i = 0; i < req->run_count; i++)
+		zram_wb_extent_record_run(zram, req->runs[i].index_start,
+					  req->runs[i].blk_start,
+					  req->runs[i].nr_pages,
+					  GFP_ATOMIC);
+
+finalize_batch:
 
 	if (success_count > 0) {
 		percpu_counter_add(&zram->stats.bd_writes, success_count);
@@ -221,16 +294,9 @@ handle_err:
 	}
 
 	/* 释放 BIO 及其挂载的所有 pages */
-	{
-		struct bio_vec *bv;
-		struct bvec_iter_all iter;
-
-		bio_for_each_segment_all(bv, bio, iter) {
-			mempool_free(bv->bv_page, zram->wb_page_pool);
-		}
-		/* bio_put 会释放 bio 内存以及 front_pad */
-		bio_put(bio);
-	}
+	zram_wb_release_bio_pages(zram, bio);
+	/* bio_put 会释放 bio 内存以及 front_pad */
+	bio_put(bio);
 }
 
 static void enqueue_wb_request(struct zram_wb_request_list *req_list,
@@ -238,7 +304,7 @@ static void enqueue_wb_request(struct zram_wb_request_list *req_list,
 {
 	spin_lock_bh(&req_list->lock);
 	list_add_tail(&req->node, &req_list->head);
-	req_list->count++;
+	WRITE_ONCE(req_list->count, req_list->count + 1);
 	spin_unlock_bh(&req_list->lock);
 }
 
@@ -253,7 +319,7 @@ static struct zram_wb_batch_request *dequeue_wb_request(
 				       struct zram_wb_batch_request,
 				       node);
 		list_del(&req->node);
-		req_list->count--;
+		WRITE_ONCE(req_list->count, req_list->count - 1);
 	}
 	spin_unlock_bh(&req_list->lock);
 
@@ -273,22 +339,14 @@ static void destroy_wb_request_list(struct zram_wb_request_list *req_list)
 		}
 		
 		/* Free pages and bio */
-		struct bio_vec *bv;
-		struct bvec_iter_all iter;
-		bio_for_each_segment_all(bv, req->bio, iter) {
-			mempool_free(bv->bv_page, req->zram->wb_page_pool);
-		}
+		zram_wb_release_bio_pages(req->zram, req->bio);
 		bio_put(req->bio);
 	}
 }
 
 static bool wb_ready_to_run(void)
 {
-	int count;
-	spin_lock_bh(&wb_req_list.lock);
-	count = wb_req_list.count;
-	spin_unlock_bh(&wb_req_list.lock);
-	return count > 0;
+	return READ_ONCE(wb_req_list.count) > 0;
 }
 
 static int wb_thread_func(void *data)
@@ -348,7 +406,9 @@ struct zram_wb_batch_request *alloc_wb_batch_request(struct zram *zram,
 	req->zram = zram;
 	req->ppctl = ctl;
 	req->bio = bio;
+	INIT_LIST_HEAD(&req->node);
 	req->count = 0; /* 初始计数为 0 */
+	req->run_count = 0;
 	req->reserved_wb_units = 0;
 
 	/* 设置 bio 的起始扇区和回调 */
