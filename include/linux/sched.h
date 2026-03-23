@@ -546,17 +546,18 @@ struct sched_entity {
 #ifdef CONFIG_SCHED_CAMBYSES
 #ifndef __GENKSYMS__
 	/*
-	 * Cached Cambyses feature values — co-located with group_node
+	 * Cached Cambyses signal values — co-located with group_node
 	 * and exec_start on the same cache line for zero-cost read
-	 * during Phase 1 scoring.  Eliminates 2 DRAM misses per task
-	 * on CPUs with limited memory-level parallelism.
+	 * during Phase 1 scoring.
 	 *
-	 * cambyses_f2: vol_switch_ratio (updated at context switch)
-	 * cambyses_f3: wakee_penalty    (updated at record_wakee)
+	 * cambyses_sig2: sig2 io_boundness   (updated at context switch)
+	 * cambyses_sig3: sig3 wakee_penalty  (updated at record_wakee)
+	 * cambyses_sig5: sig5 nvcsw_ratio    (updated at context switch)
 	 */
-	u8				cambyses_f2;
-	u8				cambyses_f3;
-	u8				__cambyses_pad[2];
+	u8				cambyses_sig2;
+	u8				cambyses_sig3;
+	u8				cambyses_sig5;
+	u8				__cambyses_pad[1];
 #endif
 #else
  					/* hole */
@@ -580,6 +581,15 @@ struct sched_entity {
 	struct cfs_rq			*my_q;
 	/* cached value of my_q->h_nr_running */
 	unsigned long			runnable_weight;
+#endif
+
+#ifdef CONFIG_SCHED_CAMBYSES
+#ifndef __GENKSYMS__
+	u64				cambyses_last_migrate;
+	u64				__cambyses_pad1;
+#endif
+#else
+ 					/* 16 bytes hole */
 #endif
 
 #ifdef CONFIG_SMP

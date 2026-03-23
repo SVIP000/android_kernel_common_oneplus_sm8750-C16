@@ -3571,6 +3571,9 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 		if (p->sched_class->migrate_task_rq)
 			p->sched_class->migrate_task_rq(p, new_cpu);
 		p->se.nr_migrations++;
+#ifdef CONFIG_SCHED_CAMBYSES
+		p->se.cambyses_last_migrate = rq_clock_task(task_rq(p));
+#endif
 		rseq_migrate(p);
 		sched_mm_cid_migrate_from(p);
 		perf_event_task_migrate(p);
@@ -7018,8 +7021,8 @@ static void __sched notrace __schedule(unsigned int sched_mode)
 		 */
 		++*switch_count;
 #ifdef CONFIG_SCHED_CAMBYSES
-		/* Update cached vol_switch_ratio for Score Shadow */
-		cambyses_update_f2(prev);
+		if (static_branch_likely(&sched_cambyses))
+			cambyses_update_ctxsw(prev);
 #endif
 
 		migrate_disable_switch(rq, prev);

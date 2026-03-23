@@ -7042,8 +7042,8 @@ static void record_wakee(struct task_struct *p)
 	}
 
 #ifdef CONFIG_SCHED_CAMBYSES
-	if (flips_changed)
-		cambyses_update_f3(current);
+	if (flips_changed && static_branch_likely(&sched_cambyses))
+		cambyses_update_sig3(current);
 #endif
 }
 

@@ -28,19 +28,39 @@ struct cambyses_candidate {
 /* Static key for zero-cost runtime disable (NOP patching) */
 extern struct static_key_true sched_cambyses;
 
-/* sysctl tunable weights (0–3, 2bit) */
-extern u8 sysctl_cambyses_w0;	/* cache coldness weight (default: 2) */
-extern u8 sysctl_cambyses_w1;	/* CPU lightness weight (default: 3) */
-extern u8 sysctl_cambyses_w2;	/* vol switch ratio weight (default: 1) */
-extern u8 sysctl_cambyses_w3;	/* wakee penalty weight (default: 1) */
+/*
+ * sysctl_cambyses_config — per-slot (signal, weight) pairs for F0..F3.
+ * Format: "src0 w0 src1 w1 src2 w2 src3 w3"
+ * Default: {0, 2,  1, 1,  2, 1,  3, -3}
+ */
+extern int sysctl_cambyses_config[8];
 
 /*
- * Score Shadow — cached feature values updated at natural update points.
- * Called from core.c (__schedule) and fair.c (record_wakee) to maintain
- * se.cambyses_f2/f3 so Phase 1 scoring avoids 2 DRAM cache-line misses.
+ * Per-weight activity keys — NOP-patched when the slot weight is 0.
+ * fair.c references cambyses_w3_active before #include "cambyses.c".
+ * All start FALSE; enabled at init for non-zero default weights.
  */
-void cambyses_update_f2(struct task_struct *p);
-void cambyses_update_f3(struct task_struct *p);
+extern struct static_key_false cambyses_w0_active;
+extern struct static_key_false cambyses_w1_active;
+extern struct static_key_false cambyses_w2_active;
+extern struct static_key_false cambyses_w3_active;
+
+/*
+ * Per-slot signal-selection keys (3 bits × 4 slots = 12 keys).
+ * All static_key_false; enabled at init and on sysctl write.
+ */
+extern struct static_key_false cambyses_f0_bit0, cambyses_f0_bit1, cambyses_f0_bit2;
+extern struct static_key_false cambyses_f1_bit0, cambyses_f1_bit1, cambyses_f1_bit2;
+extern struct static_key_false cambyses_f2_bit0, cambyses_f2_bit1, cambyses_f2_bit2;
+extern struct static_key_false cambyses_f3_bit0, cambyses_f3_bit1, cambyses_f3_bit2;
+
+/*
+ * Cached signal update hooks — called at natural event points.
+ * cambyses_update_sig3():    sig3 wakee_penalty, called from record_wakee()
+ * cambyses_update_ctxsw(): sig5 nvcsw_ratio + sig7 io_boundness, called from __schedule()
+ */
+void cambyses_update_sig3(struct task_struct *p);
+void cambyses_update_ctxsw(struct task_struct *p);
 
 /*
  * SIMD argmax — separate TUs to prevent auto-vectorization contamination.
